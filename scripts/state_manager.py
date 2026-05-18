@@ -27,7 +27,10 @@ class StateManager:
             connection.close()
 
     def _initialize_database(self) -> None:
+        """Initialize production-grade CTI database schema with all tables."""
+        
         schema = """
+        -- Processed articles tracking
         CREATE TABLE IF NOT EXISTS processed_articles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT NOT NULL UNIQUE,
@@ -35,8 +38,85 @@ class StateManager:
             source TEXT NOT NULL,
             processed_at TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_processed_articles_title ON processed_articles (title);
-        CREATE INDEX IF NOT EXISTS idx_processed_articles_source ON processed_articles (source);
+
+        -- Extracted vulnerabilities
+        CREATE TABLE IF NOT EXISTS vulnerabilities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cve_id TEXT UNIQUE,
+            cvss_base_score REAL,
+            cvss_vector TEXT,
+            description TEXT,
+            published_date TEXT,
+            nist_severity TEXT,
+            source TEXT,
+            discovered_at TEXT NOT NULL
+        );
+
+        -- Indicators of Compromise
+        CREATE TABLE IF NOT EXISTS iocs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ioc_type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source_article_id INTEGER,
+            confidence_score REAL DEFAULT 0.8,
+            extracted_at TEXT NOT NULL,
+            FOREIGN KEY(source_article_id) REFERENCES processed_articles(id),
+            UNIQUE(ioc_type, value)
+        );
+
+        -- Threat analysis results
+        CREATE TABLE IF NOT EXISTS threat_analysis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_id INTEGER NOT NULL,
+            cve_id TEXT,
+            threat_score INTEGER,
+            severity TEXT,
+            attack_vector TEXT,
+            affected_assets TEXT,
+            remediation_en TEXT,
+            remediation_fa TEXT,
+            analyzed_at TEXT NOT NULL,
+            FOREIGN KEY(article_id) REFERENCES processed_articles(id)
+        );
+
+        -- MITRE ATT&CK mappings
+        CREATE TABLE IF NOT EXISTS mitre_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cve_id TEXT,
+            tactic TEXT,
+            technique_id TEXT,
+            technique_name TEXT,
+            mapped_at TEXT NOT NULL
+        );
+
+        -- Malware campaign tracking
+        CREATE TABLE IF NOT EXISTS malware_campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_name TEXT UNIQUE,
+            description TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            ioc_ids TEXT,
+            severity TEXT
+        );
+
+        -- Historical context storage
+        CREATE TABLE IF NOT EXISTS historical_context (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reference_key TEXT UNIQUE,
+            context_data TEXT,
+            source TEXT,
+            stored_at TEXT NOT NULL
+        );
+
+        -- Create indexes for performance
+        CREATE INDEX IF NOT EXISTS idx_processed_articles_url ON processed_articles(url);
+        CREATE INDEX IF NOT EXISTS idx_processed_articles_title ON processed_articles(title);
+        CREATE INDEX IF NOT EXISTS idx_processed_articles_source ON processed_articles(source);
+        CREATE INDEX IF NOT EXISTS idx_vulnerabilities_cve ON vulnerabilities(cve_id);
+        CREATE INDEX IF NOT EXISTS idx_iocs_type_value ON iocs(ioc_type, value);
+        CREATE INDEX IF NOT EXISTS idx_threat_analysis_cve ON threat_analysis(cve_id);
+        CREATE INDEX IF NOT EXISTS idx_mitre_mappings_cve ON mitre_mappings(cve_id);
         """
 
         try:
@@ -110,3 +190,81 @@ class StateManager:
             "total_processed": total_processed,
             "latest_processed_at": latest_processed_at,
         }
+
+    def store_vulnerability(self, cve_id: str, cvss_score: float = 0.0, severity: str = "", description: str = "") -> None:
+        """Store a CVE vulnerability record."""
+        statement = """
+        INSERT OR IGNORE INTO vulnerabilities (cve_id, cvss_base_score, nist_severity, description, source, discovered_at)
+        VALUES (?, ?, ?, ?, ?, ?);
+        """
+        discovered_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connection() as connection:
+                connection.execute(statement, (cve_id, cvss_score, severity, description, "cti-agent", discovered_at))
+                connection.commit()
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to store vulnerability {cve_id}: {error}") from error
+
+    def store_ioc(self, ioc_type: str, value: str, source_article_id: int | None = None, confidence: float = 0.8) -> None:
+        """Store an IOC (Indicator of Compromise)."""
+        statement = """
+        INSERT OR IGNORE INTO iocs (ioc_type, value, source_article_id, confidence_score, extracted_at)
+        VALUES (?, ?, ?, ?, ?);
+        """
+        extracted_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connection() as connection:
+                connection.execute(statement, (ioc_type, value, source_article_id, confidence, extracted_at))
+                connection.commit()
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to store IOC {ioc_type}:{value}: {error}") from error
+
+    def store_threat_analysis(self, article_id: int, cve_id: str | None, threat_score: int, severity: str, 
+                             remediation_en: str = "", remediation_fa: str = "") -> None:
+        """Store threat analysis results."""
+        statement = """
+        INSERT INTO threat_analysis (article_id, cve_id, threat_score, severity, remediation_en, remediation_fa, analyzed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?);
+        """
+        analyzed_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connection() as connection:
+                connection.execute(statement, (article_id, cve_id, threat_score, severity, remediation_en, remediation_fa, analyzed_at))
+                connection.commit()
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to store threat analysis for article {article_id}: {error}") from error
+
+    def store_mitre_mapping(self, cve_id: str, tactic: str, technique_id: str, technique_name: str) -> None:
+        """Store MITRE ATT&CK mapping."""
+        statement = """
+        INSERT INTO mitre_mappings (cve_id, tactic, technique_id, technique_name, mapped_at)
+        VALUES (?, ?, ?, ?, ?);
+        """
+        mapped_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connection() as connection:
+                connection.execute(statement, (cve_id, tactic, technique_id, technique_name, mapped_at))
+                connection.commit()
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to store MITRE mapping for {cve_id}: {error}") from error
+
+    def get_iocs_by_type(self, ioc_type: str) -> list[dict]:
+        """Retrieve all IOCs of a specific type."""
+        query = "SELECT * FROM iocs WHERE ioc_type = ? ORDER BY extracted_at DESC;"
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(query, (ioc_type,))
+                return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to retrieve IOCs of type {ioc_type}: {error}") from error
+
+    def get_threat_analysis_by_cve(self, cve_id: str) -> dict | None:
+        """Retrieve threat analysis for a specific CVE."""
+        query = "SELECT * FROM threat_analysis WHERE cve_id = ? ORDER BY analyzed_at DESC LIMIT 1;"
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(query, (cve_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to retrieve threat analysis for {cve_id}: {error}") from error
