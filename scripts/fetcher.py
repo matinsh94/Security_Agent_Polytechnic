@@ -2,26 +2,32 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any
+from html import unescape
+from typing import Any, Iterable
+from urllib.parse import urlsplit, urlunsplit
 
 import feedparser
 import requests
-from pydantic import BaseModel, Field
+from bs4 import BeautifulSoup
 
 
-class FeedEntry(BaseModel):
+@dataclass(slots=True)
+class FeedEntry:
     """Normalized representation of collected threat intelligence."""
 
-    title: str = Field(min_length=1)
-    url: str = Field(min_length=1)
-    summary: str = Field(default="")
-    source: str = Field(min_length=1)
-    published_at: str = Field(default="")
+    title: str
+    url: str
+    summary: str
+    source: str
+    published_at: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _FeedSource:
     name: str
     url: str
@@ -32,10 +38,13 @@ class Fetcher:
 
     _KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
     _KEV_CATALOG_URL = "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+    _USER_AGENT = "SecurityAgent/1.0 (+https://github.com/matinsh94/Security_Agent_Polytechnic)"
 
-    def __init__(self) -> None:
+    def __init__(self, session: requests.Session | None = None) -> None:
+        self._session = session or requests.Session()
+        self._session.headers.update({"User-Agent": self._USER_AGENT})
         self._rss_feeds: list[_FeedSource] = [
-            _FeedSource("The Hacker News", "https://feeds.feedburner.com/TheHackerNews"),
+            _FeedSource("The Hacker News", "https://feeds.feedburner.com/TheHackersNews"),
             _FeedSource("Krebs on Security", "https://krebsonsecurity.com/feed/"),
         ]
 
@@ -43,30 +52,39 @@ class Fetcher:
     def _safe_text(value: Any, default: str = "") -> str:
         if isinstance(value, str):
             return value.strip()
-        return default
+        if value is None:
+            return default
+        return str(value).strip() or default
 
     @staticmethod
-    def _request(url: str) -> requests.Response:
-        response = requests.get(
-            url,
-            timeout=25,
-            headers={"User-Agent": "SecurityAgent/1.0 (+https://github.com/matinsh94/Security_agent)"},
-        )
+    def _canonical_url(url: str) -> str:
+        split = urlsplit(url.strip())
+        path = split.path.rstrip("/") or "/"
+        return urlunsplit((split.scheme, split.netloc, path, split.query, ""))
+
+    @staticmethod
+    def _clean_html(value: str) -> str:
+        text = unescape(value or "")
+        soup = BeautifulSoup(text, "html.parser")
+        return " ".join(soup.stripped_strings).strip()
+
+    def _request(self, url: str) -> requests.Response:
+        response = self._session.get(url, timeout=25)
         response.raise_for_status()
         return response
 
-    def _parse_rss_feed(self, source: _FeedSource) -> list[FeedEntry]:
+    def _parse_rss_feed(self, source: _FeedSource, limit: int = 10) -> list[FeedEntry]:
         """Retrieve and parse one RSS feed source."""
 
         response = self._request(source.url)
         parsed = feedparser.parse(response.content)
 
         entries: list[FeedEntry] = []
-        for item in getattr(parsed, "entries", []):
+        for item in list(getattr(parsed, "entries", []))[:limit]:
             title = self._safe_text(item.get("title"))
             url = self._safe_text(item.get("link") or item.get("id"))
-            summary = self._safe_text(item.get("summary") or item.get("description"))
-            published_at = self._safe_text(item.get("published") or item.get("updated"))
+            summary = self._clean_html(self._safe_text(item.get("summary") or item.get("description")))
+            published_at = self._safe_text(item.get("published") or item.get("updated") or item.get("date"))
 
             if not title or not url:
                 continue
@@ -74,7 +92,7 @@ class Fetcher:
             entries.append(
                 FeedEntry(
                     title=title,
-                    url=url,
+                    url=self._canonical_url(url),
                     summary=summary,
                     source=source.name,
                     published_at=published_at,
@@ -83,7 +101,7 @@ class Fetcher:
 
         return entries
 
-    def _parse_cisa_kev(self) -> list[FeedEntry]:
+    def _parse_cisa_kev(self, limit: int = 15) -> list[FeedEntry]:
         """Retrieve and convert CISA KEV JSON catalog items."""
 
         response = self._request(self._KEV_URL)
@@ -91,7 +109,7 @@ class Fetcher:
         vulnerabilities = payload.get("vulnerabilities", []) if isinstance(payload, dict) else []
 
         entries: list[FeedEntry] = []
-        for vuln in vulnerabilities:
+        for vuln in list(vulnerabilities)[:limit]:
             if not isinstance(vuln, dict):
                 continue
 
@@ -99,7 +117,7 @@ class Fetcher:
             vendor = self._safe_text(vuln.get("vendorProject"), "Unknown Vendor")
             product = self._safe_text(vuln.get("product"), "Unknown Product")
             vuln_name = self._safe_text(vuln.get("vulnerabilityName"), "Known Exploited Vulnerability")
-            short_desc = self._safe_text(vuln.get("shortDescription"), "")
+            short_desc = self._clean_html(self._safe_text(vuln.get("shortDescription"), ""))
             due_date = self._safe_text(vuln.get("dueDate"), "")
             date_added = self._safe_text(vuln.get("dateAdded"), "")
 
@@ -129,49 +147,66 @@ class Fetcher:
             FeedEntry(
                 title="Critical Zero-Day in Windows Kernel (CVE-2026-1122)",
                 url="https://example.local/mock/windows-kernel-cve-2026-1122",
-                summary="An unauthenticated attacker can gain full SYSTEM privileges via vulnerable RPC message parsing in the Windows kernel.",
+                summary=(
+                    "An unauthenticated attacker can gain full SYSTEM privileges via vulnerable RPC message parsing in the Windows kernel."
+                ),
                 source="Mock Threat Feed",
                 published_at=now,
             ),
             FeedEntry(
                 title="New Ransomware Targeting Linux Servers",
                 url="https://example.local/mock/linux-ransomware-campaign",
-                summary="A phishing campaign deploys a Linux ransomware loader that encrypts PostgreSQL and MongoDB volumes after stealing SSH keys.",
+                summary=(
+                    "A phishing campaign deploys a Linux ransomware loader that encrypts PostgreSQL and MongoDB volumes after stealing SSH keys."
+                ),
                 source="Mock Threat Feed",
                 published_at=now,
             ),
             FeedEntry(
                 title="Log4j Exploitation Wave Resurfaces with Obfuscated JNDI Payloads",
                 url="https://example.local/mock/log4j-jndi-wave",
-                summary="Attackers use nested lookup obfuscation to evade WAF signatures and trigger remote code execution in unpatched Java services.",
+                summary=(
+                    "Attackers use nested lookup obfuscation to evade WAF signatures and trigger remote code execution in unpatched Java services."
+                ),
                 source="Mock Threat Feed",
                 published_at=now,
             ),
             FeedEntry(
                 title="Public GitHub Repository Leak Exposes Cloud Production Secrets",
                 url="https://example.local/mock/github-secrets-leak",
-                summary="Hardcoded AWS keys and CI deployment tokens were leaked in a public repository, enabling lateral movement across staging and production.",
+                summary=(
+                    "Hardcoded AWS keys and CI deployment tokens were leaked in a public repository, enabling lateral movement across staging and production."
+                ),
                 source="Mock Threat Feed",
                 published_at=now,
             ),
             FeedEntry(
                 title="Malicious PyPI Package Targets CI Pipelines via setup.py Backdoor",
                 url="https://example.local/mock/pypi-supply-chain-backdoor",
-                summary="A typo-squatted package executes credential theft commands during installation and exfiltrates environment variables from runners.",
+                summary=(
+                    "A typo-squatted package executes credential theft commands during installation and exfiltrates environment variables from runners."
+                ),
                 source="Mock Threat Feed",
                 published_at=now,
             ),
         ]
 
-    def fetch_all(self, state_manager: Any, force_mock: bool = False) -> list[FeedEntry]:
-        """Collect new entries and deduplicate against persistent state.
+    @staticmethod
+    def _dedupe(entries: Iterable[FeedEntry]) -> list[FeedEntry]:
+        seen: set[tuple[str, str]] = set()
+        deduped: list[FeedEntry] = []
+        for entry in entries:
+            fingerprint = (entry.url, entry.title)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            deduped.append(entry)
+        return deduped
 
-        If all live sources fail or yield zero entries, five mock entries are
-        generated automatically to guarantee testability.
-        """
+    def fetch_all(self, state_manager: Any, force_mock: bool = False) -> list[FeedEntry]:
+        """Collect new entries and deduplicate against persistent state."""
 
         if force_mock:
-            # Test mode must always return data, independent of DB history.
             return self._mock_entries()
 
         collected: list[FeedEntry] = []
@@ -188,12 +223,11 @@ class Fetcher:
             pass
 
         if not collected:
-            # Live sources failed or returned no data; always provide mock items.
             return self._mock_entries()
 
-        new_entries: list[FeedEntry] = []
-        for entry in collected:
+        fresh_entries: list[FeedEntry] = []
+        for entry in self._dedupe(collected):
             if not state_manager.is_processed(entry.url, entry.title):
-                new_entries.append(entry)
+                fresh_entries.append(entry)
 
-        return new_entries
+        return fresh_entries

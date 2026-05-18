@@ -4,43 +4,73 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Literal, Sequence
+from typing import Any, Iterable, Sequence
 
 import requests
-from pydantic import BaseModel, Field, ValidationError
 
 from scripts.fetcher import FeedEntry
 
 
-Severity = Literal["low", "medium", "high", "critical"]
+Severity = str
 
 
-class AnalysisItem(BaseModel):
+@dataclass(slots=True)
+class AnalysisItem:
     """Structured threat analysis for one feed entry."""
 
     title: str
     source: str
+    url: str
+    published_at: str
     severity: Severity
     vulnerability_type: str
-    cvss_score: float = Field(ge=0.0, le=10.0)
-    confidence: float = Field(ge=0.0, le=1.0)
+    cvss_score: float
+    confidence: float
     attack_vector: str
     affected_assets: list[str]
     iocs: list[str]
-    summary: str
-    remediation: str
-    url: str
+    summary_en: str
+    summary_fa: str
+    remediation_en: str
+    remediation_fa: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
-class AnalysisResult(BaseModel):
+@dataclass(slots=True)
+class AnalysisResult:
     """Container for a full analyzer run."""
 
     generated_at: str
     provider: str
     used_mock_ai: bool
     total_items: int
+    summary_en: str
+    summary_fa: str
     items: list[AnalysisItem]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["items"] = [item.to_dict() for item in self.items]
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class _ThreatProfile:
+    keyword_groups: tuple[tuple[str, ...], ...]
+    severity: Severity
+    vulnerability_type: str
+    cvss_score: float
+    confidence: float
+    attack_vector: str
+    affected_assets: tuple[str, ...]
+    iocs: tuple[str, ...]
+    remediation_en: str
+    remediation_fa: str
 
 
 class Analyzer:
@@ -51,17 +81,27 @@ class Analyzer:
         api_key: str | None = None,
         model: str = "deepseek-chat",
         base_url: str = "https://api.deepseek.com/chat/completions",
+        timeout: int = 45,
     ) -> None:
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
+        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "").strip()
         self.model = model
         self.base_url = base_url
+        self.timeout = timeout
 
     def analyze(self, entries: Sequence[FeedEntry], use_mock_ai: bool = False) -> AnalysisResult:
-        """Analyze entries and return structured results.
+        """Analyze entries and return structured results."""
 
-        Falls back to a realistic mock result if `use_mock_ai=True`, if no API
-        key is configured, or if the DeepSeek call fails.
-        """
+        if not entries:
+            provider = "mock-ai" if use_mock_ai or not self.api_key else "deepseek"
+            return AnalysisResult(
+                generated_at=datetime.now(timezone.utc).isoformat(),
+                provider=provider,
+                used_mock_ai=True,
+                total_items=0,
+                summary_en="No new threat intelligence entries were available.",
+                summary_fa="هیچ ورودی جدیدی برای تحلیل تهدیدها در دسترس نبود.",
+                items=[],
+            )
 
         if use_mock_ai or not self.api_key:
             return self._mock_analysis(entries)
@@ -72,28 +112,30 @@ class Analyzer:
             return self._mock_analysis(entries)
 
     def _analyze_with_deepseek(self, entries: Sequence[FeedEntry]) -> AnalysisResult:
-        prompt_entries = [entry.model_dump() for entry in entries]
+        prompt_entries = [entry.to_dict() for entry in entries]
 
         system_prompt = (
-            "You are a senior threat intelligence analyst. "
-            "Return ONLY strict JSON with this schema: "
-            "{\"items\": [{\"title\": str, \"source\": str, \"severity\": \"low|medium|high|critical\", "
-            "\"vulnerability_type\": str, \"cvss_score\": float, \"confidence\": float, "
-            "\"attack_vector\": str, \"affected_assets\": [str], \"iocs\": [str], "
-            "\"summary\": str, \"remediation\": str, \"url\": str}]} "
-            "All text fields must be in English."
+            "You are a senior threat intelligence analyst. Return only valid JSON with this schema: "
+            '{"summary_en": str, "summary_fa": str, "items": [ {'
+            '"title": str, "source": str, "url": str, "published_at": str, '
+            '"severity": "low|medium|high|critical", "vulnerability_type": str, '
+            '"cvss_score": float, "confidence": float, "attack_vector": str, '
+            '"affected_assets": [str], "iocs": [str], "summary_en": str, "summary_fa": str, '
+            '"remediation_en": str, "remediation_fa": str } ] }.'
+            "The English and Persian summaries must be concise, professional, and faithful to the inputs."
         )
 
         user_prompt = (
-            "Analyze these threat entries and estimate realistic security risk details. "
+            "Analyze each intelligence entry and infer realistic cybersecurity details. "
+            "Use a clear severity rating, a normalized vulnerability type, and concise but actionable remediation. "
             "Keep cvss_score between 0 and 10 and confidence between 0 and 1. "
-            "All text output must be English only.\n"
+            "Provide both English and Persian summaries.\n\n"
             f"Entries:\n{json.dumps(prompt_entries, ensure_ascii=False)}"
         )
 
         response = requests.post(
             self.base_url,
-            timeout=45,
+            timeout=self.timeout,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -105,138 +147,323 @@ class Analyzer:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "response_format": {"type": "json_object"},
             },
         )
         response.raise_for_status()
 
         payload = response.json()
-        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
-        parsed = json.loads(content)
-        items = parsed.get("items", []) if isinstance(parsed, dict) else []
-
-        validated_items: list[AnalysisItem] = []
-        for item in items:
-            validated_items.append(AnalysisItem.model_validate(item))
+        content = self._extract_message_content(payload)
+        parsed = self._load_json_document(content)
+        items = self._normalize_items(parsed.get("items", []), entries)
 
         return AnalysisResult(
             generated_at=datetime.now(timezone.utc).isoformat(),
             provider="deepseek",
             used_mock_ai=False,
-            total_items=len(validated_items),
-            items=validated_items,
+            total_items=len(items),
+            summary_en=self._safe_text(parsed.get("summary_en")) or self._summarize_en(items),
+            summary_fa=self._safe_text(parsed.get("summary_fa")) or self._summarize_fa(items),
+            items=items,
         )
 
+    @staticmethod
+    def _extract_message_content(payload: dict[str, Any]) -> str:
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+            content = message.get("content", "") if isinstance(message, dict) else ""
+            return str(content)
+        raise ValueError("DeepSeek response did not include a message payload")
+
+    @staticmethod
+    def _strip_code_fences(value: str) -> str:
+        text = value.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```$", "", text)
+        return text.strip()
+
+    def _load_json_document(self, content: str) -> dict[str, Any]:
+        text = self._strip_code_fences(content)
+        start_candidates = [idx for idx in (text.find("{"), text.find("[")) if idx != -1]
+        start = min(start_candidates) if start_candidates else -1
+        if start == -1:
+            raise ValueError("DeepSeek response did not contain JSON content")
+
+        candidate = text[start:].strip()
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            parsed = json.loads(self._best_effort_json_slice(candidate))
+
+        if isinstance(parsed, list):
+            return {"items": parsed}
+        if not isinstance(parsed, dict):
+            raise ValueError("DeepSeek response JSON must be an object or array")
+        return parsed
+
+    @staticmethod
+    def _best_effort_json_slice(text: str) -> str:
+        opening = text.find("{")
+        closing = text.rfind("}")
+        if opening == -1 or closing == -1 or closing <= opening:
+            raise ValueError("Could not isolate JSON payload from DeepSeek response")
+        return text[opening : closing + 1]
+
+    @staticmethod
+    def _safe_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return str(value).strip()
+
+    @staticmethod
+    def _ensure_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if value is None:
+            return []
+        text = str(value).strip()
+        return [text] if text else []
+
+    def _normalize_items(self, raw_items: Any, entries: Sequence[FeedEntry]) -> list[AnalysisItem]:
+        normalized: list[AnalysisItem] = []
+        raw_list = raw_items if isinstance(raw_items, list) else []
+
+        for index, entry in enumerate(entries):
+            raw_item = raw_list[index] if index < len(raw_list) and isinstance(raw_list[index], dict) else {}
+            fallback = self._build_mock_item(entry)
+
+            normalized.append(
+                AnalysisItem(
+                    title=self._safe_text(raw_item.get("title")) or entry.title,
+                    source=self._safe_text(raw_item.get("source")) or entry.source,
+                    url=self._safe_text(raw_item.get("url")) or entry.url,
+                    published_at=self._safe_text(raw_item.get("published_at")) or entry.published_at,
+                    severity=self._normalize_severity(raw_item.get("severity")) or fallback.severity,
+                    vulnerability_type=self._safe_text(raw_item.get("vulnerability_type")) or fallback.vulnerability_type,
+                    cvss_score=self._coerce_float(raw_item.get("cvss_score"), fallback.cvss_score),
+                    confidence=self._coerce_float(raw_item.get("confidence"), fallback.confidence),
+                    attack_vector=self._safe_text(raw_item.get("attack_vector")) or fallback.attack_vector,
+                    affected_assets=self._ensure_list(raw_item.get("affected_assets")) or fallback.affected_assets,
+                    iocs=self._ensure_list(raw_item.get("iocs")) or fallback.iocs,
+                    summary_en=self._safe_text(raw_item.get("summary_en")) or fallback.summary_en,
+                    summary_fa=self._safe_text(raw_item.get("summary_fa")) or fallback.summary_fa,
+                    remediation_en=self._safe_text(raw_item.get("remediation_en")) or fallback.remediation_en,
+                    remediation_fa=self._safe_text(raw_item.get("remediation_fa")) or fallback.remediation_fa,
+                )
+            )
+
+        return normalized
+
+    @staticmethod
+    def _normalize_severity(value: Any) -> str:
+        severity = str(value or "").strip().lower()
+        if severity in {"low", "medium", "high", "critical"}:
+            return severity
+        return ""
+
+    @staticmethod
+    def _coerce_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     def _mock_analysis(self, entries: Sequence[FeedEntry]) -> AnalysisResult:
-        """Return deterministic mock AI output in English."""
+        """Return deterministic mock AI output in English and Persian."""
 
-        fallback_items: list[AnalysisItem] = []
-        for entry in entries:
-            fallback_items.append(self._build_mock_item(entry))
-
+        items = [self._build_mock_item(entry) for entry in entries]
         return AnalysisResult(
             generated_at=datetime.now(timezone.utc).isoformat(),
             provider="mock-ai",
             used_mock_ai=True,
-            total_items=len(fallback_items),
-            items=fallback_items,
+            total_items=len(items),
+            summary_en=self._summarize_en(items),
+            summary_fa=self._summarize_fa(items),
+            items=items,
         )
 
     def _build_mock_item(self, entry: FeedEntry) -> AnalysisItem:
-        title_lower = entry.title.lower()
+        profile = self._infer_profile(entry)
+        summary_en = self._build_summary_en(entry, profile)
+        summary_fa = self._build_summary_fa(entry, profile)
+        return AnalysisItem(
+            title=entry.title,
+            source=entry.source,
+            url=entry.url,
+            published_at=entry.published_at,
+            severity=profile.severity,
+            vulnerability_type=profile.vulnerability_type,
+            cvss_score=profile.cvss_score,
+            confidence=profile.confidence,
+            attack_vector=profile.attack_vector,
+            affected_assets=list(profile.affected_assets),
+            iocs=list(profile.iocs),
+            summary_en=summary_en,
+            summary_fa=summary_fa,
+            remediation_en=profile.remediation_en,
+            remediation_fa=profile.remediation_fa,
+        )
 
-        if "zero-day" in title_lower or "kernel" in title_lower:
-            severity: Severity = "critical"
-            vulnerability_type = "Windows kernel zero-day"
-            cvss = 9.8
-            vector = "Remote code execution through crafted RPC requests"
-            assets = ["Domain Controllers", "Windows Servers", "Tier-0 Endpoints"]
-            iocs = ["Abnormal RPC traffic spikes", "Unexpected LSASS child process", "Event ID 4688 anomalies"]
-            summary = (
-                "This threat indicates a Windows kernel zero-day that can grant SYSTEM-level execution via malformed "
-                "RPC handling. Successful exploitation can bypass endpoint controls, enable credential theft from memory, "
-                "and accelerate lateral movement in flat network segments."
-            )
-            remediation = (
-                "Immediately deploy the vendor patch, restrict RPC exposure at host and network firewalls, enable behavior-based "
-                "detections for abnormal process execution, rotate privileged credentials, and perform incident-response memory "
-                "forensics on high-value systems."
-            )
-        elif "ransomware" in title_lower:
-            severity = "high"
-            vulnerability_type = "Ransomware campaign"
-            cvss = 8.9
-            vector = "Phishing foothold followed by SSH pivot and mass encryption"
-            assets = ["Linux Application Servers", "Database Volumes", "Backup Repositories"]
-            iocs = ["Bulk file extension changes", "High entropy writes", "Unauthorized scheduled jobs"]
-            summary = (
-                "The campaign starts with phishing and moves laterally using stolen SSH material. The payload stops database "
-                "services and encrypts critical file systems while attempting to reduce traceability through log tampering."
-            )
-            remediation = (
-                "Rotate SSH keys, disable password-based SSH authentication, validate offline backup recovery, deploy file integrity "
-                "monitoring, enforce least privilege on database accounts, and isolate impacted hosts immediately."
-            )
-        elif "log4j" in title_lower:
-            severity = "high"
-            vulnerability_type = "Remote code execution in logging dependency"
-            cvss = 9.0
-            vector = "JNDI injection through headers and user-controlled fields"
-            assets = ["Java API Gateways", "Legacy Microservices", "Logging Infrastructure"]
-            iocs = ["${jndi: patterns in logs", "Unexpected LDAP egress", "Unusual JVM child processes"]
-            summary = (
-                "The attack pattern uses obfuscated JNDI payloads embedded in request metadata to trigger remote code execution "
-                "in unpatched Java workloads, followed by callback traffic to attacker-controlled infrastructure."
-            )
-            remediation = (
-                "Upgrade to a fixed logging library version, disable vulnerable lookup behavior, block outbound LDAP/RMI where "
-                "unneeded, harden WAF signatures for obfuscated payloads, and run software composition analysis across transitive dependencies."
-            )
-        elif "github" in title_lower or "leak" in title_lower:
-            severity = "high"
-            vulnerability_type = "Secret exposure"
-            cvss = 8.2
-            vector = "Credential leakage in public source repository"
-            assets = ["Cloud IAM Accounts", "CI/CD Tokens", "Container Registries"]
-            iocs = ["Unexpected cloud API usage", "Token reuse from unknown ASN", "Bulk repository cloning"]
-            summary = (
-                "Public repository exposure of operational secrets can compromise build and deployment trust boundaries. "
-                "Attackers may use leaked cloud keys and CI tokens to publish malicious artifacts or exfiltrate sensitive data."
-            )
-            remediation = (
-                "Revoke and rotate all exposed credentials, purge secrets from repository history, enforce repository secret scanning, "
-                "tighten IAM policies, and investigate cloud audit logs for unauthorized activity."
-            )
-        else:
-            severity = "high"
-            vulnerability_type = "Supply-chain package compromise"
-            cvss = 8.5
-            vector = "Malicious package execution during dependency installation"
-            assets = ["Build Runners", "Developer Workstations", "Private Package Mirrors"]
-            iocs = ["Network beacons during install", "Encoded shell payloads", "Credential file access attempts"]
-            summary = (
-                "The threat abuses software supply-chain trust by executing malicious code during package installation to steal "
-                "tokens and environment secrets, then propagates persistence into CI pipelines and downstream releases."
-            )
-            remediation = (
-                "Block suspicious packages, enforce signed internal mirrors, isolate installation environments from secrets, "
-                "pin dependency versions, apply strict dependency risk gates, and rotate CI credentials."
-            )
+    def _infer_profile(self, entry: FeedEntry) -> _ThreatProfile:
+        text = f"{entry.title} {entry.summary}".lower()
 
-        try:
-            return AnalysisItem(
-                title=entry.title,
-                source=entry.source,
-                severity=severity,
-                vulnerability_type=vulnerability_type,
-                cvss_score=cvss,
+        profiles = [
+            _ThreatProfile(
+                keyword_groups=(("zero-day", "0-day", "n-day", "kernel"),),
+                severity="critical",
+                vulnerability_type="Kernel zero-day exploitation",
+                cvss_score=9.8,
+                confidence=0.92,
+                attack_vector="Remote code execution via crafted kernel input",
+                affected_assets=("Windows servers", "Privileged endpoints", "Tier-0 systems"),
+                iocs=("Unexpected kernel faults", "RPC anomalies", "Suspicious child processes"),
+                remediation_en=(
+                    "Patch immediately, restrict exposed management interfaces, increase endpoint telemetry, and validate privileged account integrity."
+                ),
+                remediation_fa=(
+                    "وصله امنیتی را بلافاصله نصب کنید، دسترسی به رابط‌های مدیریتی را محدود کنید، تله‌متری نقاط پایانی را افزایش دهید و سلامت حساب‌های privileged را بررسی کنید."
+                ),
+            ),
+            _ThreatProfile(
+                keyword_groups=(("ransomware", "encrypt", "locker"),),
+                severity="high",
+                vulnerability_type="Ransomware intrusion",
+                cvss_score=8.9,
+                confidence=0.89,
+                attack_vector="Phishing foothold followed by lateral movement and mass encryption",
+                affected_assets=("Linux servers", "Database volumes", "Backup repositories"),
+                iocs=("Bulk file rewrites", "Encrypted extensions", "Suspicious scheduled tasks"),
+                remediation_en=(
+                    "Rotate exposed credentials, verify offline backups, isolate impacted hosts, and enforce least-privilege access on critical services."
+                ),
+                remediation_fa=(
+                    "اعتبارنامه‌های افشا شده را بچرخانید، نسخه‌های پشتیبان آفلاین را بررسی کنید، میزبان‌های آلوده را ایزوله کنید و دسترسی حداقلی را روی سرویس‌های حیاتی اعمال کنید."
+                ),
+            ),
+            _ThreatProfile(
+                keyword_groups=(("log4j", "jndi", "rce"),),
+                severity="high",
+                vulnerability_type="Application-layer remote code execution",
+                cvss_score=9.0,
                 confidence=0.88,
-                attack_vector=vector,
-                affected_assets=assets,
-                iocs=iocs,
-                summary=summary,
-                remediation=remediation,
-                url=entry.url,
-            )
-        except ValidationError as error:
-            raise RuntimeError(f"Failed to build mock analysis item for {entry.title!r}: {error}") from error
+                attack_vector="Obfuscated JNDI injection through user-controlled input",
+                affected_assets=("Java applications", "API gateways", "Logging infrastructure"),
+                iocs=("LDAP callbacks", "${jndi: patterns", "Unexpected JVM children"),
+                remediation_en=(
+                    "Upgrade vulnerable components, block outbound lookup protocols where possible, and hunt for obfuscated payloads in logs."
+                ),
+                remediation_fa=(
+                    "مولفه‌های آسیب‌پذیر را ارتقا دهید، در صورت امکان پروتکل‌های lookup خروجی را مسدود کنید و به‌دنبال payloadهای مبهم در لاگ‌ها بگردید."
+                ),
+            ),
+            _ThreatProfile(
+                keyword_groups=(("secret", "token", "leak", "github"),),
+                severity="high",
+                vulnerability_type="Secret exposure",
+                cvss_score=8.2,
+                confidence=0.87,
+                attack_vector="Credential leakage in a public repository or artifact",
+                affected_assets=("Cloud IAM accounts", "CI/CD tokens", "Container registries"),
+                iocs=("Unexpected cloud API usage", "Token reuse", "Repository cloning bursts"),
+                remediation_en=(
+                    "Revoke exposed credentials, purge secrets from history, enforce secret scanning, and review cloud audit logs for abuse."
+                ),
+                remediation_fa=(
+                    "اعتبارنامه‌های افشا شده را لغو کنید، اسرار را از تاریخچه پاک کنید، اسکن اسرار را اجباری کنید و لاگ‌های حساب ابری را برای سوءاستفاده بررسی کنید."
+                ),
+            ),
+            _ThreatProfile(
+                keyword_groups=(("pypi", "supply chain", "package", "dependency"),),
+                severity="high",
+                vulnerability_type="Software supply-chain compromise",
+                cvss_score=8.5,
+                confidence=0.86,
+                attack_vector="Malicious package execution during installation",
+                affected_assets=("Build runners", "Developer workstations", "Package mirrors"),
+                iocs=("Outbound beaconing", "Encoded shell payloads", "Secrets access attempts"),
+                remediation_en=(
+                    "Pin dependencies, use trusted package mirrors, isolate build environments from secrets, and require signed artifacts."
+                ),
+                remediation_fa=(
+                    "وابستگی‌ها را قفل کنید، از mirrorهای معتبر استفاده کنید، محیط‌های ساخت را از اسرار جدا کنید و artifactهای امضاشده را الزامی کنید."
+                ),
+            ),
+        ]
+
+        for profile in profiles:
+            if any(keyword in text for group in profile.keyword_groups for keyword in group):
+                return profile
+
+        return _ThreatProfile(
+            keyword_groups=(tuple(),),
+            severity="medium",
+            vulnerability_type="Potentially exploitable security issue",
+            cvss_score=6.5,
+            confidence=0.78,
+            attack_vector="Potential misuse of exposed services or outdated components",
+            affected_assets=("Application servers", "User endpoints", "Shared infrastructure"),
+            iocs=("Unusual service requests", "Log anomalies", "Credential misuse"),
+            remediation_en=(
+                "Review the affected asset, patch exposed components, harden access controls, and monitor logs for follow-up activity."
+            ),
+            remediation_fa=(
+                "دارایی آسیب‌دیده را بررسی کنید، مؤلفه‌های در معرض را وصله کنید، کنترل دسترسی را سخت‌گیرانه‌تر کنید و لاگ‌ها را برای فعالیت‌های بعدی پایش کنید."
+            ),
+        )
+
+    def _build_summary_en(self, entry: FeedEntry, profile: _ThreatProfile) -> str:
+        return (
+            f"{entry.title} suggests a {profile.severity} {profile.vulnerability_type.lower()} affecting "
+            f"{', '.join(profile.affected_assets[:2])}. The likely attack path is {profile.attack_vector.lower()}."
+        )
+
+    def _build_summary_fa(self, entry: FeedEntry, profile: _ThreatProfile) -> str:
+        severity_fa = self._severity_fa(profile.severity)
+        return (
+            f"{entry.title} نشان‌دهنده یک رویداد با شدت {severity_fa} و ماهیت {profile.vulnerability_type} است. "
+            f"بردار احتمالی حمله: {profile.attack_vector}. اقدام پیشنهادی: {profile.remediation_fa}"
+        )
+
+    @staticmethod
+    def _severity_fa(severity: str) -> str:
+        return {
+            "critical": "بحرانی",
+            "high": "بالا",
+            "medium": "متوسط",
+            "low": "پایین",
+        }.get(severity, "متوسط")
+
+    def _summarize_en(self, items: Iterable[AnalysisItem]) -> str:
+        items_list = list(items)
+        if not items_list:
+            return "No findings were generated."
+
+        severity_counts: dict[str, int] = {}
+        for item in items_list:
+            severity_counts[item.severity] = severity_counts.get(item.severity, 0) + 1
+
+        high_or_critical = severity_counts.get("critical", 0) + severity_counts.get("high", 0)
+        top_types = sorted({item.vulnerability_type for item in items_list})[:3]
+        return (
+            f"Analyzed {len(items_list)} items. {high_or_critical} findings require urgent attention, "
+            f"with primary focus on {', '.join(top_types)}."
+        )
+
+    def _summarize_fa(self, items: Iterable[AnalysisItem]) -> str:
+        items_list = list(items)
+        if not items_list:
+            return "هیچ یافته‌ای تولید نشد."
+
+        severity_counts: dict[str, int] = {}
+        for item in items_list:
+            severity_counts[item.severity] = severity_counts.get(item.severity, 0) + 1
+
+        urgent = severity_counts.get("critical", 0) + severity_counts.get("high", 0)
+        top_types = sorted({item.vulnerability_type for item in items_list})[:3]
+        return (
+            f"{len(items_list)} مورد تحلیل شد. {urgent} یافته نیازمند اقدام فوری هستند و تمرکز اصلی روی "
+            f"{', '.join(top_types)} است."
+        )
