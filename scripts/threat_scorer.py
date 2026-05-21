@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
+
+
+@dataclass(slots=True)
+class ThreatScoreResult:
+    """Structured threat scoring output."""
+
+    score: int
+    severity: str
+    breakdown: dict[str, float]
+    reasons: list[str]
 
 
 class ThreatScorer:
@@ -29,6 +40,28 @@ class ThreatScorer:
         is_mass_exploitation: bool = False,
     ) -> int:
         """Calculate threat score (0-100) using weighted signals."""
+
+        return self.score_threat(
+            title=title,
+            description=description,
+            cvss_score=cvss_score,
+            has_public_exploit=has_public_exploit,
+            is_in_kev=is_in_kev,
+            is_ransomware=is_ransomware,
+            is_mass_exploitation=is_mass_exploitation,
+        ).score
+
+    def score_threat(
+        self,
+        title: str,
+        description: str,
+        cvss_score: float = 0.0,
+        has_public_exploit: bool = False,
+        is_in_kev: bool = False,
+        is_ransomware: bool = False,
+        is_mass_exploitation: bool = False,
+    ) -> ThreatScoreResult:
+        """Return structured threat score and severity classification."""
 
         # Extract CVSS component (normalized 0-100)
         cvss_component = self._normalize_cvss(cvss_score)
@@ -66,7 +99,29 @@ class ThreatScorer:
             has_public_exploit=has_public_exploit,
         )
 
-        return int(min(100, max(0, final_score)))
+        score = int(min(100, max(0, final_score)))
+        severity = self.classify_severity(score)
+        reasons = self._collect_reasons(
+            title=title,
+            description=description,
+            is_in_kev=is_in_kev,
+            is_ransomware=is_ransomware,
+            has_public_exploit=has_public_exploit,
+            is_mass_exploitation=is_mass_exploitation,
+        )
+
+        return ThreatScoreResult(
+            score=score,
+            severity=severity,
+            breakdown={
+                'cvss': round(cvss_component, 2),
+                'exploitation': round(exploitation_component, 2),
+                'malware_association': round(malware_component, 2),
+                'attack_surface': round(attack_surface_component, 2),
+                'ransomware': round(ransomware_component, 2),
+            },
+            reasons=reasons,
+        )
 
     def classify_severity(self, score: int) -> str:
         """Classify severity based on threat score."""
@@ -182,6 +237,30 @@ class ThreatScorer:
             escalated_score += 15
 
         return min(100, escalated_score)
+
+    @staticmethod
+    def _collect_reasons(
+        title: str,
+        description: str,
+        is_in_kev: bool,
+        is_ransomware: bool,
+        has_public_exploit: bool,
+        is_mass_exploitation: bool,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if is_in_kev:
+            reasons.append("CISA KEV listed")
+        if is_ransomware:
+            reasons.append("Ransomware indicator detected")
+        if has_public_exploit:
+            reasons.append("Public exploit available")
+        if is_mass_exploitation:
+            reasons.append("Mass exploitation observed")
+
+        text = (title + " " + description).lower()
+        if "remote code execution" in text or "rce" in text:
+            reasons.append("Public-facing execution risk")
+        return reasons[:5]
 
     def detect_kev_signals(self, title: str, description: str) -> bool:
         """Heuristically detect if vulnerability appears to be in CISA KEV."""

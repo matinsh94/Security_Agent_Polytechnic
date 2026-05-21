@@ -25,7 +25,7 @@ class ThreatFinding:
     iocs: list[dict] | None = None
     mitre_tactics: list[str] | None = None
     remediation_en: str = ""
-    remediation_fa: str = ""
+    remediation_secondary: str = ""
 
 
 class ReportGenerator:
@@ -35,19 +35,35 @@ class ReportGenerator:
         """Initialize report generator."""
         self.generated_at = datetime.now(timezone.utc).isoformat()
 
-    def generate_json(self, findings: list[ThreatFinding], metadata: dict | None = None) -> str:
+    def generate_json(
+        self,
+        findings: list[ThreatFinding],
+        metadata: dict | None = None,
+        correlation_data: dict | None = None,
+    ) -> str:
         """Generate JSON report."""
+        cve_list = self._collect_cves(findings)
+        ioc_inventory = self._collect_iocs(findings)
         report = {
             'generated_at': self.generated_at,
             'format': 'json',
             'metadata': metadata or {},
             'summary': self._generate_summary(findings),
             'statistics': self._generate_statistics(findings),
+            'cves': cve_list,
+            'ioc_inventory': ioc_inventory,
+            'insights': self._generate_insights(findings),
+            'correlations': correlation_data or {},
             'findings': [asdict(finding) for finding in findings],
         }
         return json.dumps(report, indent=2, ensure_ascii=False)
 
-    def generate_markdown(self, findings: list[ThreatFinding], title: str = "Threat Intelligence Report") -> str:
+    def generate_markdown(
+        self,
+        findings: list[ThreatFinding],
+        title: str = "Threat Intelligence Report",
+        correlation_data: dict | None = None,
+    ) -> str:
         """Generate Markdown report."""
         lines: list[str] = []
 
@@ -67,8 +83,44 @@ class ReportGenerator:
         lines.append(f"- **Critical**: {stats.get('critical_count', 0)}")
         lines.append(f"- **High**: {stats.get('high_count', 0)}")
         lines.append(f"- **Medium**: {stats.get('medium_count', 0)}")
+        lines.append(f"- **Low**: {stats.get('low_count', 0)}")
         lines.append(f"- **Average Threat Score**: {stats.get('average_threat_score', 0):.1f}")
+        lines.append(f"- **CVE Count**: {stats.get('findings_with_cve', 0)}")
+        lines.append(f"- **IOC Findings**: {stats.get('findings_with_iocs', 0)}")
         lines.append("")
+
+        cves = self._collect_cves(findings)
+        if cves:
+            lines.append("## CVEs\n")
+            for cve in cves:
+                lines.append(f"- {cve}")
+            lines.append("")
+
+        ioc_inventory = self._collect_iocs(findings)
+        if ioc_inventory:
+            lines.append("## IOC Inventory\n")
+            for ioc_type, values in ioc_inventory.items():
+                lines.append(f"### {ioc_type.upper()}")
+                for value in values[:10]:
+                    lines.append(f"- {value}")
+                lines.append("")
+
+        insights = self._generate_insights(findings)
+        if insights:
+            lines.append("## Threat Insights\n")
+            for insight in insights:
+                lines.append(f"- {insight}")
+            lines.append("")
+
+        if correlation_data:
+            lines.append("## Correlations\n")
+            clusters = correlation_data.get("clusters", []) if isinstance(correlation_data, dict) else []
+            if isinstance(clusters, list):
+                for cluster in clusters[:10]:
+                    if not isinstance(cluster, dict):
+                        continue
+                    lines.append(f"- {cluster.get('title', 'Related cluster')} ({cluster.get('finding_count', 0)} findings)")
+            lines.append("")
 
         # Findings
         lines.append("## Threat Findings\n")
@@ -99,9 +151,9 @@ class ReportGenerator:
                 lines.append("**Remediation (English)**:")
                 lines.append(f"{finding.remediation_en}\n")
 
-            if finding.remediation_fa:
-                lines.append("**Remediation (Persian)**:")
-                lines.append(f"{finding.remediation_fa}\n")
+            if finding.remediation_secondary:
+                lines.append("**Alternative Remediation**:")
+                lines.append(f"{finding.remediation_secondary}\n")
 
             lines.append("---\n")
 
@@ -188,6 +240,8 @@ class ReportGenerator:
             'threat_count': total,
             'critical_count': critical,
             'high_count': high,
+            'cve_count': sum(1 for f in findings if f.cve_id),
+            'ioc_count': sum(len(f.iocs or []) for f in findings),
             'threat_types': list(threat_types),
         }
 
@@ -215,3 +269,41 @@ class ReportGenerator:
             'findings_with_cve': sum(1 for f in findings if f.cve_id),
             'findings_with_iocs': sum(1 for f in findings if f.iocs),
         }
+
+    @staticmethod
+    def _collect_cves(findings: list[ThreatFinding]) -> list[str]:
+        return sorted({finding.cve_id for finding in findings if finding.cve_id})
+
+    @staticmethod
+    def _collect_iocs(findings: list[ThreatFinding]) -> dict[str, list[str]]:
+        inventory: dict[str, set[str]] = {}
+        for finding in findings:
+            for ioc in finding.iocs or []:
+                if not isinstance(ioc, dict):
+                    continue
+                ioc_type = str(ioc.get('ioc_type', 'unknown')).strip().lower() or 'unknown'
+                value = str(ioc.get('value', '')).strip()
+                if not value:
+                    continue
+                inventory.setdefault(ioc_type, set()).add(value)
+        return {ioc_type: sorted(values) for ioc_type, values in sorted(inventory.items())}
+
+    @staticmethod
+    def _generate_insights(findings: list[ThreatFinding]) -> list[str]:
+        insights: list[str] = []
+        if not findings:
+            return insights
+
+        critical_or_high = [finding for finding in findings if finding.severity in {'critical', 'high'}]
+        if critical_or_high:
+            insights.append(f"{len(critical_or_high)} findings require immediate attention.")
+
+        cve_count = sum(1 for finding in findings if finding.cve_id)
+        if cve_count:
+            insights.append(f"{cve_count} findings are linked to explicit CVE identifiers.")
+
+        ioc_count = sum(len(finding.iocs or []) for finding in findings)
+        if ioc_count:
+            insights.append(f"{ioc_count} IOC records were extracted across the report.")
+
+        return insights

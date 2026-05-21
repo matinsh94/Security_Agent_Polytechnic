@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import urlsplit, urlunsplit
 
 
 class StateManager:
@@ -25,6 +26,12 @@ class StateManager:
             yield connection
         finally:
             connection.close()
+
+    @staticmethod
+    def _canonicalize_url(url: str) -> str:
+        split = urlsplit((url or "").strip())
+        path = split.path.rstrip("/") or "/"
+        return urlunsplit((split.scheme, split.netloc, path, split.query, ""))
 
     def _initialize_database(self) -> None:
         """Initialize production-grade CTI database schema with all tables."""
@@ -136,19 +143,19 @@ class StateManager:
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to reset database at {self.db_path}: {error}") from error
 
-    def is_processed(self, url: str, title: str) -> bool:
-        """Return True when URL or title already exists in state."""
+    def is_processed(self, url: str, title: str = "") -> bool:
+        """Return True when URL already exists in state."""
 
         query = """
         SELECT 1
         FROM processed_articles
-        WHERE url = ? OR title = ?
+        WHERE url = ?
         LIMIT 1;
         """
 
         try:
             with self._connection() as connection:
-                cursor = connection.execute(query, (url, title))
+                cursor = connection.execute(query, (self._canonicalize_url(url),))
                 return cursor.fetchone() is not None
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to check processed state for {url!r}: {error}") from error
@@ -161,10 +168,11 @@ class StateManager:
         VALUES (?, ?, ?, ?);
         """
         processed_at = datetime.now(timezone.utc).isoformat()
+        normalized_url = self._canonicalize_url(url)
 
         try:
             with self._connection() as connection:
-                connection.execute(statement, (url, title, source, processed_at))
+                connection.execute(statement, (normalized_url, title, source, processed_at))
                 connection.commit()
         except sqlite3.IntegrityError as error:
             raise ValueError(f"Item already exists for url={url!r}") from error

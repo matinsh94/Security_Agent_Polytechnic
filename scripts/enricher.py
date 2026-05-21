@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Optional
+from functools import lru_cache
+from typing import Any, Optional
+from urllib.parse import urlencode
 
 try:
     import requests
@@ -26,6 +28,8 @@ class CVEInfo:
     description: str = ""
     published_date: str = ""
     nist_severity: str = ""
+    kev_status: bool = False
+    exploitation_status: str = "unknown"
 
 
 @dataclass
@@ -40,68 +44,177 @@ class MITREMapping:
 class Enricher:
     """Enrich threat intelligence with external data sources."""
 
-    def __init__(self, timeout: int = 15) -> None:
+    def __init__(self, timeout: int = 15, session: Any | None = None) -> None:
         """Initialize enricher with API timeout."""
         self.timeout = timeout
-        self.nvd_base_url = "https://services.nvd.nist.gov/rest/json/cves/1.0"
+        self.nvd_base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
         self.kev_url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+        self._session = session or (requests.Session() if requests else None)
+        self._kev_cache: set[str] | None = None
+        self._cve_cache: dict[str, CVEInfo] = {}
+
+    def _request_json(self, url: str, params: dict[str, str] | None = None) -> dict[str, Any] | None:
+        if not self._session:
+            return None
+
+        response = self._session.get(url, params=params, timeout=self.timeout)
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _severity_from_score(score: float) -> str:
+        if score >= 9.0:
+            return "CRITICAL"
+        if score >= 7.0:
+            return "HIGH"
+        if score >= 4.0:
+            return "MEDIUM"
+        if score > 0:
+            return "LOW"
+        return "UNKNOWN"
+
+    @staticmethod
+    def _extract_description(payload: dict[str, Any]) -> str:
+        descriptions = payload.get("descriptions")
+        if isinstance(descriptions, list):
+            for entry in descriptions:
+                if isinstance(entry, dict) and str(entry.get("lang", "")).lower() == "en":
+                    return str(entry.get("value", "")).strip()
+        return ""
+
+    @staticmethod
+    def _extract_cvss(payload: dict[str, Any]) -> tuple[float, str]:
+        metrics = payload.get("metrics")
+        if not isinstance(metrics, dict):
+            return 0.0, ""
+
+        for metric_key in ("cvssMetricV31", "cvssMetricV30"):
+            metric_list = metrics.get(metric_key)
+            if isinstance(metric_list, list) and metric_list:
+                metric = metric_list[0]
+                if isinstance(metric, dict):
+                    data = metric.get("cvssData", {})
+                    if isinstance(data, dict):
+                        score = data.get("baseScore", 0.0)
+                        vector = data.get("vectorString", "")
+                        try:
+                            return float(score), str(vector)
+                        except (TypeError, ValueError):
+                            return 0.0, str(vector)
+        return 0.0, ""
 
     def enrich_cve(self, cve_id: str) -> CVEInfo | None:
         """Enrich CVE from NVD."""
-        if not requests:
-            logger.warning("requests library not available; skipping NVD enrichment")
+        normalized = cve_id.upper().strip()
+        if not self.extract_cve_id(normalized):
             return None
 
-        cve_info = CVEInfo(cve_id=cve_id)
+        if normalized in self._cve_cache:
+            return self._cve_cache[normalized]
 
-        # Try to parse CVSS from local description first (heuristic)
-        # In production, would call NVD API
-        logger.debug(f"Enriching CVE {cve_id} (mock mode)")
+        kev_status = self.check_kev(normalized)
+        payload = None
+        if self._session:
+            try:
+                payload = self._request_json(self.nvd_base_url, params={"cveId": normalized})
+            except Exception as error:
+                logger.debug("NVD enrichment failed for %s: %s", normalized, error)
 
+        cve_info = CVEInfo(
+            cve_id=normalized,
+            kev_status=kev_status,
+            exploitation_status="known exploited" if kev_status else "unknown",
+        )
+
+        if payload:
+            vulnerabilities = payload.get("vulnerabilities")
+            if isinstance(vulnerabilities, list) and vulnerabilities:
+                vuln = vulnerabilities[0]
+                if isinstance(vuln, dict):
+                    cve_payload = vuln.get("cve") if isinstance(vuln.get("cve"), dict) else vuln
+                    if isinstance(cve_payload, dict):
+                        cve_info.description = self._extract_description(cve_payload)
+                        cve_info.cvss_score, cve_info.cvss_vector = self._extract_cvss(cve_payload)
+                        cve_info.published_date = str(cve_payload.get("published", "")).strip()
+                        cve_info.nist_severity = self._severity_from_score(cve_info.cvss_score)
+
+        if not cve_info.cvss_score:
+            cve_info.cvss_score = self.extract_cvss_score(normalized)
+            cve_info.nist_severity = self.map_to_nist_severity(cve_info.cvss_score)
+
+        if not cve_info.nist_severity:
+            cve_info.nist_severity = self.map_to_nist_severity(cve_info.cvss_score)
+
+        self._cve_cache[normalized] = cve_info
         return cve_info
 
     def check_kev(self, cve_id: str) -> bool:
         """Check if CVE is in CISA KEV list."""
-        if not requests:
-            logger.warning("requests library not available; skipping KEV check")
+        normalized = cve_id.upper().strip()
+        if not self.extract_cve_id(normalized):
             return False
 
-        # In production, would fetch and check against KEV list
-        logger.debug(f"Checking KEV for {cve_id} (mock mode)")
+        if self._kev_cache is None:
+            self._kev_cache = set()
+            if self._session:
+                try:
+                    payload = self._request_json(self.kev_url)
+                except Exception as error:
+                    logger.debug("KEV fetch failed: %s", error)
+                    payload = None
 
-        return False
+                vulnerabilities = payload.get("vulnerabilities", []) if isinstance(payload, dict) else []
+                if isinstance(vulnerabilities, list):
+                    for vuln in vulnerabilities:
+                        if isinstance(vuln, dict):
+                            cve_value = str(vuln.get("cveID", "")).strip().upper()
+                            if cve_value:
+                                self._kev_cache.add(cve_value)
+
+        return normalized in (self._kev_cache or set())
 
     def get_mitre_mappings(self, cve_id: str) -> list[MITREMapping]:
-        """Get MITRE ATT&CK mappings for a CVE."""
-        # Heuristic-based mapping from CVE description/type
+        """Get MITRE ATT&CK mappings for a CVE or vulnerability description."""
         mappings: list[MITREMapping] = []
+        text = cve_id.lower()
 
-        # Map based on attack type keywords
-        if 'remote code execution' in cve_id.lower() or 'rce' in cve_id.lower():
-            mappings.append(MITREMapping(
-                tactic='Execution',
-                technique_id='T1190',
-                technique_name='Exploit Public-Facing Application'
-            ))
-            mappings.append(MITREMapping(
-                tactic='Initial Access',
-                technique_id='T1190',
-                technique_name='Exploit Public-Facing Application'
-            ))
+        keyword_mappings = [
+            ("remote code execution", [
+                MITREMapping(tactic="Execution", technique_id="T1203", technique_name="Exploitation for Client Execution"),
+                MITREMapping(tactic="Initial Access", technique_id="T1190", technique_name="Exploit Public-Facing Application"),
+            ]),
+            ("rce", [
+                MITREMapping(tactic="Execution", technique_id="T1203", technique_name="Exploitation for Client Execution"),
+                MITREMapping(tactic="Initial Access", technique_id="T1190", technique_name="Exploit Public-Facing Application"),
+            ]),
+            ("privilege escalation", [
+                MITREMapping(tactic="Privilege Escalation", technique_id="T1548", technique_name="Abuse Elevation Control Mechanism"),
+            ]),
+            ("authentication bypass", [
+                MITREMapping(tactic="Initial Access", technique_id="T1190", technique_name="Exploit Public-Facing Application"),
+            ]),
+            ("injection", [
+                MITREMapping(tactic="Execution", technique_id="T1059", technique_name="Command and Scripting Interpreter"),
+            ]),
+            ("denial of service", [
+                MITREMapping(tactic="Impact", technique_id="T1499", technique_name="Endpoint Denial of Service"),
+            ]),
+            ("dos", [
+                MITREMapping(tactic="Impact", technique_id="T1499", technique_name="Endpoint Denial of Service"),
+            ]),
+            ("ransomware", [
+                MITREMapping(tactic="Impact", technique_id="T1486", technique_name="Data Encrypted for Impact"),
+                MITREMapping(tactic="Discovery", technique_id="T1083", technique_name="File and Directory Discovery"),
+            ]),
+            ("supply chain", [
+                MITREMapping(tactic="Initial Access", technique_id="T1195", technique_name="Supply Chain Compromise"),
+            ]),
+        ]
 
-        if 'privilege escalation' in cve_id.lower():
-            mappings.append(MITREMapping(
-                tactic='Privilege Escalation',
-                technique_id='T1548',
-                technique_name='Abuse Elevation Control Mechanism'
-            ))
-
-        if 'denial of service' in cve_id.lower() or 'dos' in cve_id.lower():
-            mappings.append(MITREMapping(
-                tactic='Impact',
-                technique_id='T1499',
-                technique_name='Endpoint Denial of Service'
-            ))
+        for keyword, keyword_mapped in keyword_mappings:
+            if keyword in text:
+                mappings.extend(keyword_mapped)
 
         return mappings
 
@@ -197,8 +310,8 @@ class Enricher:
     def detect_remediation_guidance(self, title: str, description: str) -> dict[str, str]:
         """Generate basic remediation guidance."""
         guidance = {
-            'english': 'Apply security patches, implement access controls, monitor for suspicious activity.',
-            'persian': 'به‌روزرسانی‌های امنیتی را اعمال کنید، کنترل دسترسی را پیاده‌سازی کنید، فعالیت‌های مریب را نظارت کنید.'
+            'english': 'Apply security patches, implement access controls, and monitor for suspicious activity.',
+            'secondary': 'Apply security patches, implement access controls, and monitor for suspicious activity.'
         }
 
         # Customize based on threat type
@@ -206,15 +319,15 @@ class Enricher:
 
         if 'remote' in text and 'code execution' in text:
             guidance['english'] = 'Patch immediately, restrict network exposure, enable EDR solutions.'
-            guidance['persian'] = 'بلافاصله وصله بزنید، تعریض شبکه را محدود کنید، راه‌حل‌های EDR را فعال کنید.'
+            guidance['secondary'] = 'Patch immediately, restrict network exposure, enable EDR solutions.'
 
         elif 'ransomware' in text:
             guidance['english'] = 'Isolate affected systems, verify offline backups, enforce MFA, scan for artifacts.'
-            guidance['persian'] = 'سیستم‌های آلوده را جداسازی کنید، نسخه‌های پشتیبان را تأیید کنید، MFA را اعمال کنید.'
+            guidance['secondary'] = 'Isolate affected systems, verify offline backups, enforce MFA, and scan for artifacts.'
 
         elif 'privilege escalation' in text:
             guidance['english'] = 'Apply patches, limit privileged access, audit account privileges.'
-            guidance['persian'] = 'وصله‌ها را اعمال کنید، دسترسی ویژه را محدود کنید، امتیازات حساب را بررسی کنید.'
+            guidance['secondary'] = 'Apply patches, limit privileged access, and audit account privileges.'
 
         return guidance
 

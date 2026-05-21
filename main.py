@@ -12,6 +12,7 @@ from pathlib import Path
 
 from scripts.alerter import Alerter
 from scripts.analyzer import Analyzer
+from scripts.correlation_engine import CorrelationEngine
 from scripts.enricher import Enricher
 from scripts.fetcher import Fetcher
 from scripts.ioc_extractor import IOCExtractor
@@ -98,12 +99,29 @@ def _create_threat_findings(
 
     for item in analysis_items:
         # Extract IOCs
-        iocs = extractor.extract(item.summary_en + " " + item.summary_fa)
+        iocs = extractor.extract(item.summary_en)
+
+        cve_id = getattr(item, 'cve_id', None)
+        if not cve_id:
+            cve_id = enricher.extract_cve_id(f"{item.title} {item.summary_en}")
+
+        description = item.summary_en
+        kev_status = bool(cve_id and enricher.check_kev(cve_id))
+        threat_score = scorer.score(
+            title=item.title,
+            description=description,
+            cvss_score=getattr(item, 'cvss_score', 0.0),
+            has_public_exploit=kev_status,
+            is_in_kev=kev_status,
+            is_ransomware='ransomware' in description.lower(),
+            is_mass_exploitation=scorer.detect_mass_exploitation(item.title, description),
+        )
 
         # Get MITRE mappings
         mitre_tactics = []
-        if hasattr(item, 'vulnerability_type') and item.vulnerability_type:
-            mappings = enricher.get_mitre_mappings(item.vulnerability_type)
+        mapping_text = " ".join(filter(None, [getattr(item, 'vulnerability_type', ''), item.title, item.summary_en]))
+        if mapping_text:
+            mappings = enricher.get_mitre_mappings(mapping_text)
             mitre_tactics = [m.tactic for m in mappings]
 
         # Create threat finding
@@ -111,15 +129,15 @@ def _create_threat_findings(
             title=item.title,
             source=item.source,
             severity=item.severity,
-            threat_score=getattr(item, 'threat_score', 0),
+            threat_score=threat_score,
             cvss_score=getattr(item, 'cvss_score', 0.0),
-            cve_id=getattr(item, 'cve_id', None),
+            cve_id=cve_id,
             description=item.summary_en,
             affected_systems=getattr(item, 'affected_assets', None),
             iocs=[asdict(ioc) for ioc in iocs[:5]],  # Top 5 IOCs
             mitre_tactics=mitre_tactics,
             remediation_en=item.remediation_en,
-            remediation_fa=item.remediation_fa,
+            remediation_secondary=item.remediation_fa,
         )
         findings.append(finding)
 
@@ -169,6 +187,10 @@ def main() -> int:
         entries = fetcher.fetch_all(state_manager=state_manager, force_mock=args.test)
         logger.info(f"Fetched {len(entries)} entries")
 
+        if not entries:
+            logger.warning("Fetcher returned no entries; using mock fallback entries")
+            entries = fetcher._mock_entries()
+
         # Skip analysis if deduplication only
         if args.deduplicate_only:
             for entry in entries:
@@ -197,9 +219,12 @@ def main() -> int:
         enricher = Enricher() if args.enable_enrichment else Enricher()
         scorer = ThreatScorer()
         extractor = IOCExtractor()
+        correlation_engine = CorrelationEngine()
 
         # Create threat findings with enrichment
         findings = _create_threat_findings(analysis_result.items, scorer, enricher, extractor)
+        correlation_result = correlation_engine.correlate(findings)
+        correlation_data = correlation_result.to_dict()
 
         # Generate report in requested format
         logger.info(f"Generating report ({args.output_format} format)...")
@@ -211,10 +236,15 @@ def main() -> int:
                 metadata={
                     "mode": "test" if args.test else "live",
                     "enriched": args.enable_enrichment,
-                }
+                },
+                correlation_data=correlation_data,
             )
         elif args.output_format == "markdown":
-            report_output = report_gen.generate_markdown(findings, title="Threat Intelligence Report")
+            report_output = report_gen.generate_markdown(
+                findings,
+                title="Threat Intelligence Report",
+                correlation_data=correlation_data,
+            )
         elif args.output_format == "csv":
             report_output = report_gen.generate_csv(findings)
         elif args.output_format == "stix":

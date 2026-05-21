@@ -6,6 +6,10 @@ A **production-grade Cyber Threat Intelligence (CTI) platform** designed for aut
 
 This system functions as a lightweight **Threat Intelligence Platform (TIP)**, conceptually aligned with systems such as **MISP** and commercial CTI solutions. It is designed for **operational cybersecurity use**, not as a demo or academic prototype.
 
+All generated output, logs, reports, and documentation in this repository are maintained in English only.
+
+Current implementation status: the repository now includes a stabilized Phase 1 pipeline with fallback feed parsing, deterministic mock threat generation, SQLite deduplication, structured analysis output, IOC extraction, enrichment helpers, threat scoring, and report generation. Phase 2 work will be added only after Phase 1 is verified end-to-end.
+
 ### Core Capabilities
 - **Real-time threat intelligence ingestion** from verified security sources
 - **Structured CVE-based vulnerability analysis** with CVSS scoring
@@ -323,7 +327,7 @@ This enables:
 - Exploitation reasoning
 - Remediation guidance
 - Historical context enrichment
-- Multi-language output (English + Persian)
+- English-only output for analysis and reporting
 
 **Fallback Mode** (fully offline):
 - Structured mock intelligence generation (not random)

@@ -92,14 +92,13 @@ class Analyzer:
         """Analyze entries and return structured results."""
 
         if not entries:
-            provider = "mock-ai" if use_mock_ai or not self.api_key else "deepseek"
             return AnalysisResult(
                 generated_at=datetime.now(timezone.utc).isoformat(),
-                provider=provider,
+                provider="mock-ai" if use_mock_ai or not self.api_key else "deepseek",
                 used_mock_ai=True,
                 total_items=0,
                 summary_en="No new threat intelligence entries were available.",
-                summary_fa="هیچ ورودی جدیدی برای تحلیل تهدیدها در دسترس نبود.",
+                summary_fa="No new threat intelligence entries were available.",
                 items=[],
             )
 
@@ -121,15 +120,15 @@ class Analyzer:
             '"severity": "low|medium|high|critical", "vulnerability_type": str, '
             '"cvss_score": float, "confidence": float, "attack_vector": str, '
             '"affected_assets": [str], "iocs": [str], "summary_en": str, "summary_fa": str, '
-            '"remediation_en": str, "remediation_fa": str } ] }.'
-            "The English and Persian summaries must be concise, professional, and faithful to the inputs."
+            '"remediation_en": str, "remediation_fa": str } ] }. '
+            "All textual fields must be written in English only and must remain concise, professional, and faithful to the inputs."
         )
 
         user_prompt = (
             "Analyze each intelligence entry and infer realistic cybersecurity details. "
             "Use a clear severity rating, a normalized vulnerability type, and concise but actionable remediation. "
             "Keep cvss_score between 0 and 10 and confidence between 0 and 1. "
-            "Provide both English and Persian summaries.\n\n"
+            "Provide English-only summaries and remediation guidance.\n\n"
             f"Entries:\n{json.dumps(prompt_entries, ensure_ascii=False)}"
         )
 
@@ -162,7 +161,7 @@ class Analyzer:
             used_mock_ai=False,
             total_items=len(items),
             summary_en=self._safe_text(parsed.get("summary_en")) or self._summarize_en(items),
-            summary_fa=self._safe_text(parsed.get("summary_fa")) or self._summarize_fa(items),
+            summary_fa=self._safe_text(parsed.get("summary_fa")) or self._summarize_en(items),
             items=items,
         )
 
@@ -170,9 +169,12 @@ class Analyzer:
     def _extract_message_content(payload: dict[str, Any]) -> str:
         choices = payload.get("choices")
         if isinstance(choices, list) and choices:
-            message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-            content = message.get("content", "") if isinstance(message, dict) else ""
-            return str(content)
+            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+            message = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
+            if isinstance(message, dict) and message.get("content") is not None:
+                return str(message.get("content", ""))
+            if first_choice.get("text") is not None:
+                return str(first_choice.get("text", ""))
         raise ValueError("DeepSeek response did not include a message payload")
 
     @staticmethod
@@ -272,7 +274,7 @@ class Analyzer:
             return default
 
     def _mock_analysis(self, entries: Sequence[FeedEntry]) -> AnalysisResult:
-        """Return deterministic mock AI output in English and Persian."""
+        """Return deterministic mock AI output in English only."""
 
         items = [self._build_mock_item(entry) for entry in entries]
         return AnalysisResult(
@@ -281,7 +283,7 @@ class Analyzer:
             used_mock_ai=True,
             total_items=len(items),
             summary_en=self._summarize_en(items),
-            summary_fa=self._summarize_fa(items),
+            summary_fa=self._summarize_en(items),
             items=items,
         )
 
@@ -302,9 +304,9 @@ class Analyzer:
             affected_assets=list(profile.affected_assets),
             iocs=list(profile.iocs),
             summary_en=summary_en,
-            summary_fa=summary_fa,
+            summary_fa=summary_en,
             remediation_en=profile.remediation_en,
-            remediation_fa=profile.remediation_fa,
+            remediation_fa=profile.remediation_en,
         )
 
     def _infer_profile(self, entry: FeedEntry) -> _ThreatProfile:
@@ -324,7 +326,7 @@ class Analyzer:
                     "Patch immediately, restrict exposed management interfaces, increase endpoint telemetry, and validate privileged account integrity."
                 ),
                 remediation_fa=(
-                    "وصله امنیتی را بلافاصله نصب کنید، دسترسی به رابط‌های مدیریتی را محدود کنید، تله‌متری نقاط پایانی را افزایش دهید و سلامت حساب‌های privileged را بررسی کنید."
+                    "Patch immediately, restrict exposed management interfaces, increase endpoint telemetry, and validate privileged account integrity."
                 ),
             ),
             _ThreatProfile(
@@ -340,7 +342,7 @@ class Analyzer:
                     "Rotate exposed credentials, verify offline backups, isolate impacted hosts, and enforce least-privilege access on critical services."
                 ),
                 remediation_fa=(
-                    "اعتبارنامه‌های افشا شده را بچرخانید، نسخه‌های پشتیبان آفلاین را بررسی کنید، میزبان‌های آلوده را ایزوله کنید و دسترسی حداقلی را روی سرویس‌های حیاتی اعمال کنید."
+                    "Rotate exposed credentials, verify offline backups, isolate impacted hosts, and enforce least-privilege access on critical services."
                 ),
             ),
             _ThreatProfile(
@@ -356,7 +358,7 @@ class Analyzer:
                     "Upgrade vulnerable components, block outbound lookup protocols where possible, and hunt for obfuscated payloads in logs."
                 ),
                 remediation_fa=(
-                    "مولفه‌های آسیب‌پذیر را ارتقا دهید، در صورت امکان پروتکل‌های lookup خروجی را مسدود کنید و به‌دنبال payloadهای مبهم در لاگ‌ها بگردید."
+                    "Upgrade vulnerable components, block outbound lookup protocols where possible, and hunt for obfuscated payloads in logs."
                 ),
             ),
             _ThreatProfile(
@@ -372,7 +374,7 @@ class Analyzer:
                     "Revoke exposed credentials, purge secrets from history, enforce secret scanning, and review cloud audit logs for abuse."
                 ),
                 remediation_fa=(
-                    "اعتبارنامه‌های افشا شده را لغو کنید، اسرار را از تاریخچه پاک کنید، اسکن اسرار را اجباری کنید و لاگ‌های حساب ابری را برای سوءاستفاده بررسی کنید."
+                    "Revoke exposed credentials, purge secrets from history, enforce secret scanning, and review cloud audit logs for abuse."
                 ),
             ),
             _ThreatProfile(
@@ -388,7 +390,7 @@ class Analyzer:
                     "Pin dependencies, use trusted package mirrors, isolate build environments from secrets, and require signed artifacts."
                 ),
                 remediation_fa=(
-                    "وابستگی‌ها را قفل کنید، از mirrorهای معتبر استفاده کنید، محیط‌های ساخت را از اسرار جدا کنید و artifactهای امضاشده را الزامی کنید."
+                    "Pin dependencies, use trusted package mirrors, isolate build environments from secrets, and require signed artifacts."
                 ),
             ),
         ]
@@ -410,7 +412,7 @@ class Analyzer:
                 "Review the affected asset, patch exposed components, harden access controls, and monitor logs for follow-up activity."
             ),
             remediation_fa=(
-                "دارایی آسیب‌دیده را بررسی کنید، مؤلفه‌های در معرض را وصله کنید، کنترل دسترسی را سخت‌گیرانه‌تر کنید و لاگ‌ها را برای فعالیت‌های بعدی پایش کنید."
+                "Review the affected asset, patch exposed components, harden access controls, and monitor logs for follow-up activity."
             ),
         )
 
@@ -421,20 +423,20 @@ class Analyzer:
         )
 
     def _build_summary_fa(self, entry: FeedEntry, profile: _ThreatProfile) -> str:
-        severity_fa = self._severity_fa(profile.severity)
+        severity_label = self._severity_label(profile.severity)
         return (
-            f"{entry.title} نشان‌دهنده یک رویداد با شدت {severity_fa} و ماهیت {profile.vulnerability_type} است. "
-            f"بردار احتمالی حمله: {profile.attack_vector}. اقدام پیشنهادی: {profile.remediation_fa}"
+            f"{entry.title} indicates a {severity_label} event involving {profile.vulnerability_type}. "
+            f"Likely attack vector: {profile.attack_vector}. Recommended action: {profile.remediation_en}"
         )
 
     @staticmethod
-    def _severity_fa(severity: str) -> str:
+    def _severity_label(severity: str) -> str:
         return {
-            "critical": "بحرانی",
-            "high": "بالا",
-            "medium": "متوسط",
-            "low": "پایین",
-        }.get(severity, "متوسط")
+            "critical": "critical",
+            "high": "high",
+            "medium": "medium",
+            "low": "low",
+        }.get(severity, "medium")
 
     def _summarize_en(self, items: Iterable[AnalysisItem]) -> str:
         items_list = list(items)
@@ -455,7 +457,7 @@ class Analyzer:
     def _summarize_fa(self, items: Iterable[AnalysisItem]) -> str:
         items_list = list(items)
         if not items_list:
-            return "هیچ یافته‌ای تولید نشد."
+            return "No findings were generated."
 
         severity_counts: dict[str, int] = {}
         for item in items_list:
@@ -464,6 +466,6 @@ class Analyzer:
         urgent = severity_counts.get("critical", 0) + severity_counts.get("high", 0)
         top_types = sorted({item.vulnerability_type for item in items_list})[:3]
         return (
-            f"{len(items_list)} مورد تحلیل شد. {urgent} یافته نیازمند اقدام فوری هستند و تمرکز اصلی روی "
-            f"{', '.join(top_types)} است."
+            f"Analyzed {len(items_list)} items. {urgent} findings require urgent attention, "
+            f"with primary focus on {', '.join(top_types)}."
         )
