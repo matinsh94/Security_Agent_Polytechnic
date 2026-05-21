@@ -6,6 +6,7 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
@@ -36,6 +37,7 @@ class AnalysisItem:
     summary_fa: str
     remediation_en: str
     remediation_fa: str
+    exploitation_likelihood: str = "medium"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -88,10 +90,12 @@ class Analyzer:
         self.base_url = base_url
         self.timeout = timeout
 
-    def analyze(self, entries: Sequence[FeedEntry], use_mock_ai: bool = False) -> AnalysisResult:
+    def analyze(self, entries: Sequence[FeedEntry], use_mock_ai: bool = False, enricher: Any | None = None) -> AnalysisResult:
         """Analyze entries and return structured results."""
 
-        if not entries:
+        prepared_entries = self._apply_enrichment_context(entries, enricher)
+
+        if not prepared_entries:
             return AnalysisResult(
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 provider="mock-ai" if use_mock_ai or not self.api_key else "deepseek",
@@ -103,12 +107,38 @@ class Analyzer:
             )
 
         if use_mock_ai or not self.api_key:
-            return self._mock_analysis(entries)
+            return self._mock_analysis(prepared_entries)
 
         try:
-            return self._analyze_with_deepseek(entries)
+            return self._analyze_with_deepseek(prepared_entries)
         except Exception:
-            return self._mock_analysis(entries)
+            return self._mock_analysis(prepared_entries)
+
+    def _apply_enrichment_context(self, entries: Sequence[FeedEntry], enricher: Any | None) -> list[FeedEntry]:
+        if enricher is None:
+            return list(entries)
+
+        prepared: list[FeedEntry] = []
+        for entry in entries:
+            cve_id = getattr(enricher, "extract_cve_id", lambda value: None)(f"{entry.title} {entry.summary}")
+            enrichment_parts: list[str] = []
+            if cve_id and hasattr(enricher, "enrich_cve"):
+                info = enricher.enrich_cve(cve_id)
+                if info:
+                    if info.cvss_score:
+                        enrichment_parts.append(f"CVSS {info.cvss_score:.1f}")
+                    if info.nist_severity:
+                        enrichment_parts.append(f"Severity {info.nist_severity}")
+                    if info.exploitation_status:
+                        enrichment_parts.append(f"Exploit status {info.exploitation_status}")
+                    if info.description:
+                        enrichment_parts.append(f"Affected software {info.description}")
+            summary = entry.summary
+            if enrichment_parts:
+                summary = f"{summary} Enrichment context: {'; '.join(enrichment_parts)}."
+            prepared.append(replace(entry, summary=summary))
+
+        return prepared
 
     def _analyze_with_deepseek(self, entries: Sequence[FeedEntry]) -> AnalysisResult:
         prompt_entries = [entry.to_dict() for entry in entries]
@@ -120,7 +150,7 @@ class Analyzer:
             '"severity": "low|medium|high|critical", "vulnerability_type": str, '
             '"cvss_score": float, "confidence": float, "attack_vector": str, '
             '"affected_assets": [str], "iocs": [str], "summary_en": str, "summary_fa": str, '
-            '"remediation_en": str, "remediation_fa": str } ] }. '
+            '"remediation_en": str, "remediation_fa": str, "exploitation_likelihood": "low|medium|high" } ] }. '
             "All textual fields must be written in English only and must remain concise, professional, and faithful to the inputs."
         )
 
@@ -128,6 +158,7 @@ class Analyzer:
             "Analyze each intelligence entry and infer realistic cybersecurity details. "
             "Use a clear severity rating, a normalized vulnerability type, and concise but actionable remediation. "
             "Keep cvss_score between 0 and 10 and confidence between 0 and 1. "
+            "Include exploitation_likelihood as low, medium, or high. "
             "Provide English-only summaries and remediation guidance.\n\n"
             f"Entries:\n{json.dumps(prompt_entries, ensure_ascii=False)}"
         )
@@ -254,6 +285,7 @@ class Analyzer:
                     summary_fa=self._safe_text(raw_item.get("summary_fa")) or fallback.summary_fa,
                     remediation_en=self._safe_text(raw_item.get("remediation_en")) or fallback.remediation_en,
                     remediation_fa=self._safe_text(raw_item.get("remediation_fa")) or fallback.remediation_fa,
+                    exploitation_likelihood=self._safe_text(raw_item.get("exploitation_likelihood")) or fallback.exploitation_likelihood,
                 )
             )
 
@@ -307,6 +339,7 @@ class Analyzer:
             summary_fa=summary_en,
             remediation_en=profile.remediation_en,
             remediation_fa=profile.remediation_en,
+            exploitation_likelihood=self._derive_exploitation_likelihood(profile.severity, profile.keyword_groups, entry.summary),
         )
 
     def _infer_profile(self, entry: FeedEntry) -> _ThreatProfile:
@@ -469,3 +502,12 @@ class Analyzer:
             f"Analyzed {len(items_list)} items. {urgent} findings require urgent attention, "
             f"with primary focus on {', '.join(top_types)}."
         )
+
+    @staticmethod
+    def _derive_exploitation_likelihood(severity: str, keyword_groups: tuple[tuple[str, ...], ...], text: str) -> str:
+        lower_text = text.lower()
+        if severity == "critical" or any(keyword in lower_text for group in keyword_groups for keyword in group if keyword):
+            return "high"
+        if severity == "high":
+            return "medium"
+        return "low"

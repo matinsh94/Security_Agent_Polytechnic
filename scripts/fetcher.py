@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -88,6 +90,11 @@ class Fetcher:
         split = urlsplit(url.strip())
         path = split.path.rstrip("/") or "/"
         return urlunsplit((split.scheme, split.netloc, path, split.query, ""))
+
+    @staticmethod
+    def _extract_cve(text: str) -> str:
+        match = re.search(r"\bCVE-\d{4}-\d{4,}\b", text, re.IGNORECASE)
+        return match.group(0).upper() if match else ""
 
     @staticmethod
     def _clean_html(value: str) -> str:
@@ -324,7 +331,8 @@ class Fetcher:
 
         fresh_entries: list[FeedEntry] = []
         for entry in self._dedupe(collected):
-            if not state_manager.is_processed(entry.url, entry.title):
+            cve_id = self._extract_cve(f"{entry.title} {entry.summary}")
+            if not state_manager.is_processed(entry.url, entry.title, cve_id):
                 fresh_entries.append(entry)
 
         if fresh_entries:

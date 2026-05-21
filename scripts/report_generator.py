@@ -53,6 +53,7 @@ class ReportGenerator:
             'cves': cve_list,
             'ioc_inventory': ioc_inventory,
             'insights': self._generate_insights(findings),
+            'correlation_summary': self._generate_correlation_summary(correlation_data),
             'correlations': correlation_data or {},
             'findings': [asdict(finding) for finding in findings],
         }
@@ -112,14 +113,36 @@ class ReportGenerator:
                 lines.append(f"- {insight}")
             lines.append("")
 
+        mitre_summary = self._generate_mitre_summary(findings)
+        if mitre_summary:
+            lines.append("## MITRE Mapping Summary\n")
+            for tactic, count in mitre_summary.items():
+                lines.append(f"- {tactic}: {count}")
+            lines.append("")
+
+        top_threats = sorted(findings, key=lambda finding: finding.threat_score, reverse=True)[:10]
+        if top_threats:
+            lines.append("## Top 10 Threats\n")
+            for finding in top_threats:
+                cve_part = f" ({finding.cve_id})" if finding.cve_id else ""
+                lines.append(f"- {finding.title}{cve_part} - {finding.severity.upper()} - {finding.threat_score}/100")
+            lines.append("")
+
         if correlation_data:
+            correlation_summary = self._generate_correlation_summary(correlation_data)
+            if correlation_summary:
+                lines.append("## Correlation Summary\n")
+                for line in correlation_summary:
+                    lines.append(f"- {line}")
+                lines.append("")
+
             lines.append("## Correlations\n")
             clusters = correlation_data.get("clusters", []) if isinstance(correlation_data, dict) else []
             if isinstance(clusters, list):
                 for cluster in clusters[:10]:
                     if not isinstance(cluster, dict):
                         continue
-                    lines.append(f"- {cluster.get('title', 'Related cluster')} ({cluster.get('finding_count', 0)} findings)")
+                    lines.append(f"- {cluster.get('title', 'Related cluster')} ({cluster.get('finding_count', 0)} findings, risk {cluster.get('risk_score', 0)}/100)")
             lines.append("")
 
         # Findings
@@ -307,3 +330,32 @@ class ReportGenerator:
             insights.append(f"{ioc_count} IOC records were extracted across the report.")
 
         return insights
+
+    @staticmethod
+    def _generate_mitre_summary(findings: list[ThreatFinding]) -> dict[str, int]:
+        summary: dict[str, int] = {}
+        for finding in findings:
+            for tactic in finding.mitre_tactics or []:
+                normalized = str(tactic).strip()
+                if not normalized:
+                    continue
+                summary[normalized] = summary.get(normalized, 0) + 1
+        return dict(sorted(summary.items(), key=lambda item: item[0]))
+
+    @staticmethod
+    def _generate_correlation_summary(correlation_data: dict | None) -> list[str]:
+        if not correlation_data or not isinstance(correlation_data, dict):
+            return []
+
+        clusters = correlation_data.get('clusters', [])
+        if not isinstance(clusters, list) or not clusters:
+            return []
+
+        total_clusters = correlation_data.get('total_clusters', len(clusters))
+        related_findings = correlation_data.get('related_findings', 0)
+        high_risk = sum(1 for cluster in clusters if isinstance(cluster, dict) and int(cluster.get('risk_score', 0)) >= 70)
+        return [
+            f"{total_clusters} campaign clusters identified.",
+            f"{related_findings} findings are linked across clusters.",
+            f"{high_risk} clusters have risk scores of 70 or higher.",
+        ]

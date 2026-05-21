@@ -8,7 +8,7 @@ This system functions as a lightweight **Threat Intelligence Platform (TIP)**, c
 
 All generated output, logs, reports, and documentation in this repository are maintained in English only.
 
-Current implementation status: the repository now includes a stabilized Phase 1 pipeline with fallback feed parsing, deterministic mock threat generation, SQLite deduplication, structured analysis output, IOC extraction, enrichment helpers, threat scoring, and report generation. Phase 2 work will be added only after Phase 1 is verified end-to-end.
+Current implementation status: Phase 2: Intelligence Enrichment Layer Implemented.
 
 ### Core Capabilities
 - **Real-time threat intelligence ingestion** from verified security sources
@@ -17,31 +17,30 @@ Current implementation status: the repository now includes a stabilized Phase 1 
 - **AI-powered threat analysis** (DeepSeek API with fallback mock mode)
 - **Threat scoring engine** (0–100 risk model with weighted signals)
 - **MITRE ATT&CK mapping** for attacker behavior classification
-- **Historical intelligence memory** using GitBook + optional Vector DB
+- **Historical context storage** using SQLite
 - **Deduplication and stateful processing** (SQLite)
 - **Multi-format reporting** (JSON, Markdown, CSV, CTI-ready exports)
 - **Optional alerting system** (Telegram, Discord, Slack integration)
-- **Enrichment layer** (NVD, CISA KEV, ExploitDB, MITRE)
+- **Enrichment layer** (NVD, CISA KEV, MITRE)
+- **Campaign correlation engine** (shared CVE/IOC/software grouping)
 
 ## System Architecture
 
 ```mermaid
 graph LR
     A[Threat Feeds] --> B[Fetcher Layer]
-    B --> C[Normalization Layer]
-    C --> D[IOC Extraction Engine]
-    D --> E[Deduplication & State Manager]
-    E --> F[Enrichment Layer<br/>NVD/KEV/MITRE]
+    B --> C[IOC Extraction Engine]
+    C --> D[Deduplication & State Manager]
+    D --> E[Enrichment Layer<br/>NVD/KEV/MITRE]
+    E --> F[AI Analysis Engine]
     F --> G[Threat Scoring Engine]
-    G --> H[AI Analysis Engine]
-    H --> I[Historical Memory<br/>GitBook + Vector DB]
-    I --> J[Correlation Engine]
-    J --> K[Report Generator]
-    K --> L[Alerting System]
-    L --> M[Output Formats<br/>JSON/MD/CSV]
+    G --> H[Correlation Engine]
+    H --> I[Report Generator]
+    I --> J[Alerting System]
+    J --> K[Output Formats<br/>JSON/MD/CSV/STIX]
 ```
 
-**Data Flow**: Raw feeds → Parsed entries → Extracted IOCs → Enriched with CVE/KEV/MITRE metadata → Scored and analyzed → Correlated with history → Formatted reports → Alerts dispatched
+**Data Flow**: Raw feeds → Parsed entries → Extracted IOCs → Persisted state and deduplication → Enriched with CVE/KEV/MITRE metadata → Analyzed and scored → Correlated into campaigns → Formatted reports → Alerts dispatched
 
 ## Technologies
 
@@ -60,7 +59,7 @@ graph LR
 | **Reporting** | Jinja2 | 3.1.0+ |
 | **Testing** | pytest | 7.0.0+ |
 | **Optional: Alerting** | requests (Telegram/Discord) | 2.31.0+ |
-| **Optional: Memory** | GitBook API / vector-db | As needed |
+| **Optional: Memory** | SQLite historical context | Built-in |
 
 ## Installation
 
@@ -68,7 +67,7 @@ graph LR
 - Python 3.11 or higher
 - pip or conda
 - DeepSeek API key (for live analysis; optional—mock mode works offline)
-- Optional: GitBook API key (for historical memory storage)
+- Optional: Discord or Slack webhook URLs (for alerts)
 
 ### Setup Steps
 
@@ -91,11 +90,12 @@ graph LR
 
 4. **Configure Environment Variables**
    ```bash
-   cp .env.example .env  # or create manually
+    touch .env  # or create manually
    export DEEPSEEK_API_KEY="your-api-key-here"        # Optional
-   export GITBOOK_API_KEY="your-gitbook-key"          # Optional
    export TELEGRAM_BOT_TOKEN="your-telegram-token"    # Optional
    export TELEGRAM_CHAT_ID="your-chat-id"             # Optional
+    export DISCORD_WEBHOOK_URL="your-discord-webhook"  # Optional
+    export SLACK_WEBHOOK_URL="your-slack-webhook"      # Optional
    ```
 
 5. **Initialize Database**
@@ -149,11 +149,13 @@ python3 main.py --live --enable-enrichment --enable-alerting --output-format jso
 | `--live` | Fetch from real security feeds (requires internet) |
 | `--enable-enrichment` | Enrich with NVD, CISA KEV, MITRE ATT&CK |
 | `--enable-alerting` | Send alerts via Telegram/Discord/Slack |
+| `--test-alerts` | Test configured alerting channels and exit |
 | `--reset-db` | Clear database before processing |
 | `--init-db` | Initialize/migrate database schema |
-| `--output-format` | Output format: `json`, `markdown`, `csv` (default: json) |
+| `--output-format` | Output format: `json`, `markdown`, `csv`, `stix` (default: json) |
 | `--output-file` | Write results to file instead of stdout |
 | `--deduplicate-only` | Only deduplicate, skip analysis |
+| `--verbose` | Enable debug logging |
 
 ---
 
@@ -164,84 +166,111 @@ SQLite stores structured intelligence with the following schema:
 ```sql
 -- Processed articles tracking
 CREATE TABLE processed_articles (
-    id INTEGER PRIMARY KEY,
-    url TEXT UNIQUE NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,
-    source TEXT,
-    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    source TEXT NOT NULL,
+    processed_at TEXT NOT NULL
+);
+
+-- Processed fingerprints for hybrid deduplication
+CREATE TABLE processed_signatures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    cve_id TEXT,
+    source TEXT NOT NULL,
+    processed_at TEXT NOT NULL
 );
 
 -- Extracted vulnerabilities
 CREATE TABLE vulnerabilities (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     cve_id TEXT UNIQUE,
     cvss_base_score REAL,
     cvss_vector TEXT,
     description TEXT,
-    published_date TIMESTAMP,
+    published_date TEXT,
     nist_severity TEXT,
     source TEXT,
-    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    discovered_at TEXT NOT NULL
 );
 
 -- Indicators of Compromise
 CREATE TABLE iocs (
-    id INTEGER PRIMARY KEY,
-    ioc_type TEXT NOT NULL,  -- 'ip', 'domain', 'url', 'hash', 'email', 'payload'
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ioc_type TEXT NOT NULL,
     value TEXT NOT NULL,
     source_article_id INTEGER,
-    confidence_score REAL,
-    extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(source_article_id) REFERENCES processed_articles(id)
+    confidence_score REAL DEFAULT 0.8,
+    extracted_at TEXT NOT NULL,
+    FOREIGN KEY(source_article_id) REFERENCES processed_articles(id),
+    UNIQUE(ioc_type, value)
 );
 
 -- Threat analysis results
 CREATE TABLE threat_analysis (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     article_id INTEGER NOT NULL,
     cve_id TEXT,
-    threat_score INTEGER,  -- 0-100
-    severity TEXT,  -- critical, high, medium, low
+    threat_score INTEGER,
+    severity TEXT,
     attack_vector TEXT,
-    affected_assets TEXT,  -- JSON array
+    affected_assets TEXT,
     remediation_en TEXT,
     remediation_fa TEXT,
-    analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    analyzed_at TEXT NOT NULL,
     FOREIGN KEY(article_id) REFERENCES processed_articles(id)
 );
 
 -- MITRE ATT&CK mappings
 CREATE TABLE mitre_mappings (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     cve_id TEXT,
-    tactic TEXT,  -- e.g., 'Initial Access'
-    technique_id TEXT,  -- e.g., 'T1190'
+    tactic TEXT,
+    technique_id TEXT,
     technique_name TEXT,
-    mapped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    mapped_at TEXT NOT NULL
 );
 
 -- Malware campaign tracking
 CREATE TABLE malware_campaigns (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     campaign_name TEXT UNIQUE,
     description TEXT,
-    first_seen TIMESTAMP,
-    last_seen TIMESTAMP,
-    ioc_ids TEXT,  -- JSON array of IOC IDs
+    first_seen TEXT,
+    last_seen TEXT,
+    ioc_ids TEXT,
     severity TEXT
 );
 
 -- Historical context storage
 CREATE TABLE historical_context (
-    id INTEGER PRIMARY KEY,
-    reference_key TEXT UNIQUE,  -- CVE, malware name, etc.
-    context_data TEXT,  -- JSON
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference_key TEXT UNIQUE,
+    context_data TEXT,
     source TEXT,
-    stored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    stored_at TEXT NOT NULL
+);
+
+-- Campaign correlation storage
+CREATE TABLE campaign_correlations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL UNIQUE,
+    related_cves TEXT NOT NULL,
+    risk_score INTEGER NOT NULL,
+    explanation TEXT NOT NULL,
+    finding_titles TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 -- Create indexes for performance
 CREATE INDEX idx_processed_articles_url ON processed_articles(url);
+CREATE INDEX idx_processed_articles_title ON processed_articles(title);
+CREATE INDEX idx_processed_articles_source ON processed_articles(source);
+CREATE INDEX idx_processed_signatures_fp ON processed_signatures(fingerprint);
+CREATE INDEX idx_processed_signatures_cve ON processed_signatures(cve_id);
 CREATE INDEX idx_vulnerabilities_cve ON vulnerabilities(cve_id);
 CREATE INDEX idx_iocs_type_value ON iocs(ioc_type, value);
 CREATE INDEX idx_threat_analysis_cve ON threat_analysis(cve_id);
@@ -326,7 +355,8 @@ This enables:
 - Impact analysis
 - Exploitation reasoning
 - Remediation guidance
-- Historical context enrichment
+- Enrichment-aware prompt context
+- Exploitation likelihood labeling
 - English-only output for analysis and reporting
 
 **Fallback Mode** (fully offline):
@@ -336,21 +366,16 @@ This enables:
 
 ---
 
-## Historical Intelligence Memory
+## Historical Context Storage
 
-Optional **GitBook integration** for long-term datastore:
+SQLite persists the operational state required by the platform:
 
-- CVE history and evolution
-- IOC patterns and timelines
-- Malware campaign tracking
-- MITRE mappings and trends
-- AI-generated analysis reports
-
-**Optional Vector Database** (semantic search):
-- Enables RAG-based retrieval
-- Similar vulnerability detection
-- Threat evolution tracking
-- Contextual correlation
+- Processed article fingerprints for deduplication
+- Extracted CVE and IOC records
+- Threat analysis output
+- MITRE ATT&CK mappings
+- Historical context records
+- Correlation clusters for related campaigns
 
 ---
 
@@ -363,17 +388,16 @@ Optional **GitBook integration** for long-term datastore:
 | **JSON** | Machine-readable, automation, SIEM import |
 | **Markdown** | SOC reports, documentation, archives |
 | **CSV** | Spreadsheet analysis, bulk export |
-| **CTI Export** | STIX-compatible structured feeds |
+| **STIX** | STIX-like structured feeds |
 
 **Report Contents:**
 - Executive summary (threat overview)
+- Top 10 threats
 - Severity breakdown
 - Top CVEs with CVSS scores
-- Active exploitation status
-- Malware campaign summary
-- IOC tables (IPs, domains, hashes)
+- IOC inventory and findings
 - MITRE ATT&CK overview
-- Risk trends and historical comparison
+- Correlation summary and cluster details
 - Remediation guidance
 
 ---
@@ -385,10 +409,9 @@ Real security intelligence sources only:
 | Source | Type | Frequency |
 |--------|------|-----------|
 | The Hacker News | RSS | Real-time |
-| BleepingComputer | RSS | Real-time |
 | Krebs on Security | RSS | Daily |
 | CISA KEV | JSON API | Daily |
-| NVD CVE | JSON API | Real-time |
+| Mock Threat Feed | Synthetic | Test mode only |
 
 **Validation & Resilience:**
 - Retry logic with exponential backoff
@@ -407,10 +430,9 @@ Real security intelligence sources only:
 Security_Agent_Polytechnic/
 ├── main.py                      # CLI entrypoint
 ├── requirements.txt             # Python dependencies
-├── .env.example                 # Environment variable template
 ├── README.md                    # This file
 ├── data/
-│   └── agent_state.db          # SQLite database (production schema)
+│   └── agent_state.db           # SQLite database (production schema)
 ├── scripts/
 │   ├── fetcher.py              # Feed ingestion + normalization
 │   ├── analyzer.py             # AI analysis engine
@@ -418,20 +440,20 @@ Security_Agent_Polytechnic/
 │   ├── ioc_extractor.py        # IOC extraction engine
 │   ├── threat_scorer.py        # Threat scoring (0-100)
 │   ├── enricher.py             # NVD/KEV/MITRE enrichment
+│   ├── correlation_engine.py   # Campaign correlation and clustering
 │   ├── report_generator.py     # Multi-format report creation
 │   └── alerter.py              # Telegram/Discord/Slack alerts
 └── tests/
-    ├── test_fetcher.py
-    ├── test_analyzer.py
+    ├── test_enricher.py
     ├── test_ioc_extraction.py
-    └── test_threat_scoring.py
+    └── test_threat_scorer.py
 ```
 
 ---
 
 ## System Evolution Roadmap
 
-### Current Release (v1.0)
+### Current Release (v1.1)
 - ✅ Real-time feed ingestion (RSS + APIs)
 - ✅ IOC extraction and normalization
 - ✅ Threat scoring (0-100)
@@ -440,12 +462,11 @@ Security_Agent_Polytechnic/
 - ✅ Structured reporting (JSON/Markdown/CSV)
 - ✅ SQLite deduplication & state management
 
-### Phase 2: Enrichment & Analytics (v1.1)
-- [ ] NVD/CISA integration for real-time CVE matching
-- [ ] ExploitDB/GitHub PoC availability detection
-- [ ] Automated malware campaign correlation
-- [ ] Historical threat trend analysis
-- [ ] Predictive vulnerability scoring
+### Phase 2: Intelligence Enrichment Layer Implemented
+- ✅ NVD/CISA KEV enrichment and CVE matching
+- ✅ Campaign correlation and cluster persistence
+- ✅ English-only alerting and reporting
+- ✅ Enrichment-aware AI analysis context
 
 ### Phase 3: Integration & Collaboration (v1.2)
 - [ ] SIEM integration (Splunk, ELK, Sumo Logic)
@@ -456,7 +477,6 @@ Security_Agent_Polytechnic/
 
 ### Phase 4: Advanced Intelligence (v1.3)
 - [ ] Vector database integration (semantic search)
-- [ ] GitBook historical memory storage
 - [ ] Anomaly detection in threat patterns
 - [ ] Threat actor attribution (OSINT)
 - [ ] Geolocation-based threat mapping
@@ -506,6 +526,7 @@ All intelligence output MUST adhere to:
 |-------------|----------|
 | **Language** | English only (SOC-standard) |
 | **Structure** | JSON for machine processing, Markdown for reports |
+| **STIX** | STIX-like output for structured feeds |
 | **Encoding** | UTF-8 without BOM |
 | **Timestamps** | ISO 8601 (UTC) |
 | **CVSS** | CVSS v3.1 standard |
@@ -524,10 +545,7 @@ All intelligence output MUST adhere to:
 DEEPSEEK_API_KEY=your_api_key_here
 DEEPSEEK_API_URL=https://api.deepseek.com/v1
 
-# Optional: Historical Memory
-GITBOOK_API_KEY=your_gitbook_key
-GITBOOK_SPACE_ID=space_id
-
+# Optional: Additional Integrations
 # Optional: Alerting
 TELEGRAM_BOT_TOKEN=bot_token
 TELEGRAM_CHAT_ID=chat_id
@@ -663,8 +681,8 @@ If you use this project in academic or professional work, please cite:
 
 ---
 
-**Platform Status**: Production Ready (v1.0)  
-**Last Updated**: May 18, 2026  
+**Platform Status**: Production Ready (v1.1)
+**Last Updated**: May 21, 2026
 **Maintained By**: Matin Shafiei
 
 ---

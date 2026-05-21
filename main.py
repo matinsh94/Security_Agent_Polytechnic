@@ -7,7 +7,7 @@ import json
 import logging
 import sys
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from scripts.alerter import Alerter
@@ -144,6 +144,32 @@ def _create_threat_findings(
     return findings
 
 
+def _prepare_analysis_entries(entries, enricher: Enricher) -> list:
+    """Attach enrichment hints to feed entries before analysis."""
+
+    prepared = []
+    for entry in entries:
+        cve_id = enricher.extract_cve_id(f"{entry.title} {entry.summary}")
+        if cve_id:
+            info = enricher.enrich_cve(cve_id)
+            if info:
+                hints = [f"CVE {info.cve_id}"]
+                if info.cvss_score:
+                    hints.append(f"CVSS {info.cvss_score:.1f}")
+                if info.nist_severity:
+                    hints.append(f"Severity {info.nist_severity}")
+                if info.exploitation_status:
+                    hints.append(f"Exploit status {info.exploitation_status}")
+                if info.description:
+                    hints.append(f"Affected software {info.description}")
+                enriched_summary = f"{entry.summary} Enrichment hints: {'; '.join(hints)}."
+                prepared.append(replace(entry, summary=enriched_summary))
+                continue
+        prepared.append(entry)
+
+    return prepared
+
+
 def main() -> int:
     """Run the production CTI pipeline."""
 
@@ -195,24 +221,12 @@ def main() -> int:
         if args.deduplicate_only:
             for entry in entries:
                 try:
-                    state_manager.mark_as_processed(entry.url, entry.title, entry.source)
+                    state_manager.mark_as_processed(entry.url, entry.title, entry.source, fetcher._extract_cve(f"{entry.title} {entry.summary}"))
                 except ValueError:
                     continue
             logger.info("Deduplication complete")
             print(json.dumps({"status": "deduplicated", "entries": len(entries)}))
             return 0
-
-        # Analyze threats
-        logger.info("Analyzing threats...")
-        analyzer = Analyzer()
-        analysis_result = analyzer.analyze(entries=entries, use_mock_ai=args.mock_ai)
-
-        # Mark as processed
-        for entry in entries:
-            try:
-                state_manager.mark_as_processed(entry.url, entry.title, entry.source)
-            except ValueError:
-                continue
 
         # Enrich if requested
         logger.info(f"Enrichment: {'enabled' if args.enable_enrichment else 'disabled'}")
@@ -221,10 +235,37 @@ def main() -> int:
         extractor = IOCExtractor()
         correlation_engine = CorrelationEngine()
 
+        analysis_entries = _prepare_analysis_entries(entries, enricher)
+
+        # Analyze threats
+        logger.info("Analyzing threats...")
+        analyzer = Analyzer()
+        analysis_result = analyzer.analyze(entries=analysis_entries, use_mock_ai=args.mock_ai, enricher=enricher)
+
+        # Mark as processed
+        for entry in entries:
+            try:
+                cve_id = fetcher._extract_cve(f"{entry.title} {entry.summary}")
+                state_manager.mark_as_processed(entry.url, entry.title, entry.source, cve_id)
+            except ValueError:
+                continue
+
         # Create threat findings with enrichment
         findings = _create_threat_findings(analysis_result.items, scorer, enricher, extractor)
         correlation_result = correlation_engine.correlate(findings)
         correlation_data = correlation_result.to_dict()
+
+        for cluster in correlation_result.clusters:
+            try:
+                state_manager.store_correlation_cluster(
+                    cluster.campaign_id,
+                    cluster.cves,
+                    cluster.risk_score,
+                    cluster.explanation,
+                    cluster.finding_titles,
+                )
+            except Exception:
+                logger.debug("Failed to persist correlation cluster %s", cluster.campaign_id)
 
         # Generate report in requested format
         logger.info(f"Generating report ({args.output_format} format)...")

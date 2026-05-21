@@ -23,8 +23,13 @@ class Alerter:
         """Initialize alerter with API credentials from environment."""
         self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        self.telegram_webhook_url = os.getenv('TELEGRAM_WEBHOOK_URL')
         self.discord_webhook = os.getenv('DISCORD_WEBHOOK_URL')
         self.slack_webhook = os.getenv('SLACK_WEBHOOK_URL')
+
+    @staticmethod
+    def _severity_rank(severity: str) -> int:
+        return {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(str(severity).lower(), 0)
 
     def send_critical_alert(self, title: str, threat_score: int, cve_id: str | None = None) -> bool:
         """Send alert for critical threats (score >= 90)."""
@@ -56,27 +61,42 @@ class Alerter:
 
         return any(results.values())
 
+    def _dispatch(self, message: str) -> bool:
+        delivered = False
+        if self.telegram_bot_token or self.telegram_webhook_url:
+            delivered = self.send_telegram(message) or delivered
+        if self.discord_webhook:
+            delivered = self.send_discord(message) or delivered
+        if self.slack_webhook:
+            delivered = self.send_slack(message) or delivered
+        return delivered
+
     def send_telegram(self, message: str) -> bool:
         """Send alert via Telegram."""
-        if not requests or not self.telegram_bot_token or not self.telegram_chat_id:
+        if not requests:
             logger.warning("Telegram not configured or requests unavailable")
             return False
 
-        url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-        payload = {
-            'chat_id': self.telegram_chat_id,
-            'text': message,
-            'parse_mode': 'HTML',
-        }
-
         try:
-            response = requests.post(url, json=payload, timeout=10)
-            if response.status_code == 200:
+            if self.telegram_webhook_url:
+                response = requests.post(self.telegram_webhook_url, json={"text": message}, timeout=10)
+            elif self.telegram_bot_token and self.telegram_chat_id:
+                url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+                payload = {
+                    'chat_id': self.telegram_chat_id,
+                    'text': message,
+                    'parse_mode': 'HTML',
+                }
+                response = requests.post(url, json=payload, timeout=10)
+            else:
+                logger.warning("Telegram not configured or requests unavailable")
+                return False
+
+            if response.status_code in (200, 201, 204):
                 logger.info("Telegram alert sent successfully")
                 return True
-            else:
-                logger.error(f"Telegram alert failed: {response.status_code} {response.text}")
-                return False
+            logger.error(f"Telegram alert failed: {response.status_code} {response.text}")
+            return False
         except Exception as error:
             logger.error(f"Telegram error: {error}")
             return False
@@ -160,20 +180,43 @@ class Alerter:
         }
 
         for finding in findings:
-            threat_score = finding.get('threat_score', 0)
+            severity = str(finding.get('severity', '')).lower()
+            threat_score = int(finding.get('threat_score', 0))
             title = finding.get('title', '')
             cve_id = finding.get('cve_id')
 
-            if threat_score >= 90:
-                if self.send_critical_alert(title, threat_score, cve_id):
+            should_alert = self._severity_rank(severity) >= self._severity_rank('high') or threat_score >= 70
+
+            if not should_alert:
+                continue
+
+            message = self.format_finding_message(finding)
+            if severity == 'critical' or threat_score >= 90:
+                if self._dispatch(message):
                     results['critical'] += 1
                     results['total_sent'] += 1
-            elif threat_score >= 70:
-                if self.send_high_alert(title, threat_score, cve_id):
+            else:
+                if self._dispatch(message):
                     results['high'] += 1
                     results['total_sent'] += 1
 
         return results
+
+    @staticmethod
+    def format_finding_message(finding: dict) -> str:
+        cve_id = finding.get('cve_id') or 'N/A'
+        severity = str(finding.get('severity', 'unknown')).upper()
+        cvss_score = finding.get('cvss_score', 0.0)
+        summary = finding.get('description', '') or finding.get('summary', '') or finding.get('title', '')
+        action = finding.get('remediation_en') or finding.get('remediation_secondary') or 'Investigate, contain, and patch affected systems.'
+        return (
+            f"<b>Threat</b>: {finding.get('title', 'Unnamed threat')}\n"
+            f"<b>CVE</b>: {cve_id}\n"
+            f"<b>Severity</b>: {severity}\n"
+            f"<b>CVSS</b>: {cvss_score}\n"
+            f"<b>Summary</b>: {summary}\n"
+            f"<b>Recommended action</b>: {action}"
+        )
 
     def test_connection(self) -> dict[str, bool]:
         """Test alerting channel connections."""

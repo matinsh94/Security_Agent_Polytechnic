@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 from urllib.parse import urlsplit, urlunsplit
+import json
 
 
 class StateManager:
@@ -44,6 +45,26 @@ class StateManager:
             title TEXT NOT NULL,
             source TEXT NOT NULL,
             processed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS processed_signatures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint TEXT NOT NULL UNIQUE,
+            url TEXT NOT NULL,
+            title TEXT NOT NULL,
+            cve_id TEXT,
+            source TEXT NOT NULL,
+            processed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS campaign_correlations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id TEXT NOT NULL UNIQUE,
+            related_cves TEXT NOT NULL,
+            risk_score INTEGER NOT NULL,
+            explanation TEXT NOT NULL,
+            finding_titles TEXT NOT NULL,
+            created_at TEXT NOT NULL
         );
 
         -- Extracted vulnerabilities
@@ -120,6 +141,8 @@ class StateManager:
         CREATE INDEX IF NOT EXISTS idx_processed_articles_url ON processed_articles(url);
         CREATE INDEX IF NOT EXISTS idx_processed_articles_title ON processed_articles(title);
         CREATE INDEX IF NOT EXISTS idx_processed_articles_source ON processed_articles(source);
+        CREATE INDEX IF NOT EXISTS idx_processed_signatures_fp ON processed_signatures(fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_processed_signatures_cve ON processed_signatures(cve_id);
         CREATE INDEX IF NOT EXISTS idx_vulnerabilities_cve ON vulnerabilities(cve_id);
         CREATE INDEX IF NOT EXISTS idx_iocs_type_value ON iocs(ioc_type, value);
         CREATE INDEX IF NOT EXISTS idx_threat_analysis_cve ON threat_analysis(cve_id);
@@ -129,6 +152,13 @@ class StateManager:
         try:
             with self._connection() as connection:
                 connection.executescript(schema)
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO processed_signatures (fingerprint, url, title, cve_id, source, processed_at)
+                    SELECT url || '|' || title || '|', url, title, '', source, processed_at
+                    FROM processed_articles
+                    """
+                )
                 connection.commit()
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to initialize database at {self.db_path}: {error}") from error
@@ -139,40 +169,53 @@ class StateManager:
         try:
             with self._connection() as connection:
                 connection.execute("DELETE FROM processed_articles;")
+                connection.execute("DELETE FROM processed_signatures;")
+                connection.execute("DELETE FROM campaign_correlations;")
                 connection.commit()
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to reset database at {self.db_path}: {error}") from error
 
-    def is_processed(self, url: str, title: str = "") -> bool:
-        """Return True when URL already exists in state."""
+    def _fingerprint(self, url: str, title: str, cve_id: str = "") -> str:
+        normalized_url = self._canonicalize_url(url)
+        normalized_title = (title or "").strip().lower()
+        normalized_cve = (cve_id or "").strip().upper()
+        return f"{normalized_url}|{normalized_title}|{normalized_cve}"
 
-        query = """
-        SELECT 1
-        FROM processed_articles
-        WHERE url = ?
-        LIMIT 1;
-        """
+    def is_processed(self, url: str, title: str = "", cve_id: str = "") -> bool:
+        """Return True when a hybrid fingerprint already exists in state."""
+
+        fingerprint = self._fingerprint(url, title, cve_id)
 
         try:
             with self._connection() as connection:
-                cursor = connection.execute(query, (self._canonicalize_url(url),))
+                cursor = connection.execute("SELECT 1 FROM processed_signatures WHERE fingerprint = ? LIMIT 1;", (fingerprint,))
+                if cursor.fetchone() is not None:
+                    return True
+                cursor = connection.execute("SELECT 1 FROM processed_articles WHERE url = ? LIMIT 1;", (self._canonicalize_url(url),))
                 return cursor.fetchone() is not None
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to check processed state for {url!r}: {error}") from error
 
-    def mark_as_processed(self, url: str, title: str, source: str = "") -> None:
+    def mark_as_processed(self, url: str, title: str, source: str = "", cve_id: str = "") -> None:
         """Store an item as processed using UTC ISO timestamp."""
 
         statement = """
         INSERT INTO processed_articles (url, title, source, processed_at)
         VALUES (?, ?, ?, ?);
         """
+        signature_statement = """
+        INSERT OR IGNORE INTO processed_signatures (fingerprint, url, title, cve_id, source, processed_at)
+        VALUES (?, ?, ?, ?, ?, ?);
+        """
         processed_at = datetime.now(timezone.utc).isoformat()
         normalized_url = self._canonicalize_url(url)
+        fingerprint = self._fingerprint(url, title, cve_id)
+        normalized_cve = (cve_id or "").strip().upper()
 
         try:
             with self._connection() as connection:
                 connection.execute(statement, (normalized_url, title, source, processed_at))
+                connection.execute(signature_statement, (fingerprint, normalized_url, title, normalized_cve, source, processed_at))
                 connection.commit()
         except sqlite3.IntegrityError as error:
             raise ValueError(f"Item already exists for url={url!r}") from error
@@ -256,13 +299,15 @@ class StateManager:
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to store MITRE mapping for {cve_id}: {error}") from error
 
+    def store_correlation_cluster(self, campaign_id: str, related_cves: list[str], risk_score: int, explanation: str, finding_titles: list[str]) -> None:
+        """Store a correlation cluster in SQLite."""
+
     def get_iocs_by_type(self, ioc_type: str) -> list[dict]:
         """Retrieve all IOCs of a specific type."""
         query = "SELECT * FROM iocs WHERE ioc_type = ? ORDER BY extracted_at DESC;"
         try:
             with self._connection() as connection:
                 cursor = connection.execute(query, (ioc_type,))
-                return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to retrieve IOCs of type {ioc_type}: {error}") from error
 

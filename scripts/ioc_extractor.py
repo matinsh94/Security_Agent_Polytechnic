@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+import ipaddress
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -69,7 +70,7 @@ class IOCExtractor:
 
         for match in self.patterns["ipv4"].finditer(text):
             value = match.group(0)
-            if not self._is_private_ip(value):
+            if self._is_valid_public_ipv4(value):
                 add_ioc("ipv4", value, 0.95)
 
         for match in self.patterns["email"].finditer(text):
@@ -92,7 +93,8 @@ class IOCExtractor:
                 continue
             if any(domain == host or domain.endswith(f".{host}") for host in url_hosts):
                 continue
-            add_ioc("domain", domain, 0.76)
+            if self._is_valid_domain(domain):
+                add_ioc("domain", domain, 0.76)
 
         return extracted
 
@@ -128,15 +130,32 @@ class IOCExtractor:
         return urlunsplit((split.scheme.lower(), split.netloc.lower(), path, split.query, ""))
 
     @staticmethod
-    def _is_private_ip(ip: str) -> bool:
-        private_ranges = (
-            r"^10\.",
-            r"^172\.(1[6-9]|2[0-9]|3[01])\.",
-            r"^192\.168\.",
-            r"^127\.",
-            r"^169\.254\.",
+    def _is_valid_public_ipv4(ip: str) -> bool:
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return (
+            ip_obj.version == 4
+            and not ip_obj.is_private
+            and not ip_obj.is_loopback
+            and not ip_obj.is_link_local
+            and not ip_obj.is_multicast
+            and not ip_obj.is_reserved
         )
-        return any(re.match(pattern, ip) for pattern in private_ranges)
+
+    @staticmethod
+    def _is_valid_domain(domain: str) -> bool:
+        labels = domain.split('.')
+        if len(labels) < 2:
+            return False
+        if any(not label or len(label) > 63 or label.startswith('-') or label.endswith('-') for label in labels):
+            return False
+        if all(label.isdigit() for label in labels):
+            return False
+        if len(labels[-1]) < 2:
+            return False
+        return True
 
     @staticmethod
     def _is_internal_email(email: str) -> bool:
