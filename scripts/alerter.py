@@ -226,7 +226,7 @@ class Alerter:
             'slack': False,
         }
 
-        if self.telegram_bot_token and self.telegram_chat_id:
+        if (self.telegram_bot_token and self.telegram_chat_id) or self.telegram_webhook_url:
             status['telegram'] = self.send_telegram("✓ CTI Agent test message")
 
         if self.discord_webhook:

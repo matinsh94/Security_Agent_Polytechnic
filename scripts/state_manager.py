@@ -171,6 +171,12 @@ class StateManager:
                 connection.execute("DELETE FROM processed_articles;")
                 connection.execute("DELETE FROM processed_signatures;")
                 connection.execute("DELETE FROM campaign_correlations;")
+                connection.execute("DELETE FROM vulnerabilities;")
+                connection.execute("DELETE FROM iocs;")
+                connection.execute("DELETE FROM threat_analysis;")
+                connection.execute("DELETE FROM mitre_mappings;")
+                connection.execute("DELETE FROM malware_campaigns;")
+                connection.execute("DELETE FROM historical_context;")
                 connection.commit()
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to reset database at {self.db_path}: {error}") from error
@@ -196,8 +202,20 @@ class StateManager:
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to check processed state for {url!r}: {error}") from error
 
-    def mark_as_processed(self, url: str, title: str, source: str = "", cve_id: str = "") -> None:
-        """Store an item as processed using UTC ISO timestamp."""
+    def get_article_id_by_url(self, url: str) -> int | None:
+        """Retrieve article ID by its URL."""
+        normalized_url = self._canonicalize_url(url)
+        query = "SELECT id FROM processed_articles WHERE url = ? LIMIT 1;"
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(query, (normalized_url,))
+                row = cursor.fetchone()
+                return int(row["id"]) if row else None
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to get article ID for {url!r}: {error}") from error
+
+    def mark_as_processed(self, url: str, title: str, source: str = "", cve_id: str = "") -> int:
+        """Store an item as processed using UTC ISO timestamp and return article ID."""
 
         statement = """
         INSERT INTO processed_articles (url, title, source, processed_at)
@@ -214,10 +232,12 @@ class StateManager:
 
         try:
             with self._connection() as connection:
-                connection.execute(statement, (normalized_url, title, source, processed_at))
+                cursor = connection.execute(statement, (normalized_url, title, source, processed_at))
                 connection.execute(signature_statement, (fingerprint, normalized_url, title, normalized_cve, source, processed_at))
                 connection.commit()
+                return int(cursor.lastrowid)
         except sqlite3.IntegrityError as error:
+            existing_id = self.get_article_id_by_url(url)
             raise ValueError(f"Item already exists for url={url!r}") from error
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to persist processed state for {url!r}: {error}") from error
@@ -242,19 +262,41 @@ class StateManager:
             "latest_processed_at": latest_processed_at,
         }
 
-    def store_vulnerability(self, cve_id: str, cvss_score: float = 0.0, severity: str = "", description: str = "") -> None:
+    def store_vulnerability(
+        self,
+        cve_id: str,
+        cvss_score: float = 0.0,
+        severity: str = "",
+        description: str = "",
+        cvss_vector: str = "",
+        published_date: str = "",
+        source: str = "cti-agent",
+    ) -> None:
         """Store a CVE vulnerability record."""
         statement = """
-        INSERT OR IGNORE INTO vulnerabilities (cve_id, cvss_base_score, nist_severity, description, source, discovered_at)
-        VALUES (?, ?, ?, ?, ?, ?);
+        INSERT OR REPLACE INTO vulnerabilities (cve_id, cvss_base_score, cvss_vector, description, published_date, nist_severity, source, discovered_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         """
         discovered_at = datetime.now(timezone.utc).isoformat()
         try:
             with self._connection() as connection:
-                connection.execute(statement, (cve_id, cvss_score, severity, description, "cti-agent", discovered_at))
+                connection.execute(
+                    statement,
+                    (cve_id, cvss_score, cvss_vector, description, published_date, severity, source, discovered_at),
+                )
                 connection.commit()
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to store vulnerability {cve_id}: {error}") from error
+
+    def get_vulnerabilities(self, limit: int = 100) -> list[dict]:
+        """Retrieve stored vulnerability records."""
+        query = "SELECT * FROM vulnerabilities ORDER BY discovered_at DESC LIMIT ?;"
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(query, (limit,))
+                return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to retrieve vulnerabilities: {error}") from error
 
     def store_ioc(self, ioc_type: str, value: str, source_article_id: int | None = None, confidence: float = 0.8) -> None:
         """Store an IOC (Indicator of Compromise)."""
@@ -270,17 +312,33 @@ class StateManager:
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to store IOC {ioc_type}:{value}: {error}") from error
 
-    def store_threat_analysis(self, article_id: int, cve_id: str | None, threat_score: int, severity: str, 
-                             remediation_en: str = "", remediation_fa: str = "") -> None:
+    def store_threat_analysis(
+        self,
+        article_id: int,
+        cve_id: str | None,
+        threat_score: int,
+        severity: str,
+        attack_vector: str = "",
+        affected_assets: list[str] | str = "",
+        remediation_en: str = "",
+        remediation_fa: str = "",
+    ) -> None:
         """Store threat analysis results."""
         statement = """
-        INSERT INTO threat_analysis (article_id, cve_id, threat_score, severity, remediation_en, remediation_fa, analyzed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO threat_analysis (article_id, cve_id, threat_score, severity, attack_vector, affected_assets, remediation_en, remediation_fa, analyzed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
+        if isinstance(affected_assets, list):
+            affected_assets_str = json.dumps(affected_assets)
+        else:
+            affected_assets_str = str(affected_assets or "")
         analyzed_at = datetime.now(timezone.utc).isoformat()
         try:
             with self._connection() as connection:
-                connection.execute(statement, (article_id, cve_id, threat_score, severity, remediation_en, remediation_fa, analyzed_at))
+                connection.execute(
+                    statement,
+                    (article_id, cve_id, threat_score, severity, attack_vector, affected_assets_str, remediation_en, remediation_fa, analyzed_at),
+                )
                 connection.commit()
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to store threat analysis for article {article_id}: {error}") from error
@@ -299,8 +357,58 @@ class StateManager:
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to store MITRE mapping for {cve_id}: {error}") from error
 
-    def store_correlation_cluster(self, campaign_id: str, related_cves: list[str], risk_score: int, explanation: str, finding_titles: list[str]) -> None:
+    def store_correlation_cluster(
+        self,
+        campaign_id: str,
+        related_cves: list[str],
+        risk_score: int,
+        explanation: str,
+        finding_titles: list[str],
+    ) -> None:
         """Store a correlation cluster in SQLite."""
+        statement = """
+        INSERT OR REPLACE INTO campaign_correlations (campaign_id, related_cves, risk_score, explanation, finding_titles, created_at)
+        VALUES (?, ?, ?, ?, ?, ?);
+        """
+        created_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connection() as connection:
+                connection.execute(
+                    statement,
+                    (
+                        campaign_id,
+                        json.dumps(related_cves),
+                        risk_score,
+                        explanation,
+                        json.dumps(finding_titles),
+                        created_at,
+                    ),
+                )
+                connection.commit()
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to store correlation cluster {campaign_id}: {error}") from error
+
+    def get_correlation_clusters(self) -> list[dict]:
+        """Retrieve all stored correlation clusters."""
+        query = "SELECT * FROM campaign_correlations ORDER BY risk_score DESC, created_at DESC;"
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(query)
+                results = []
+                for row in cursor.fetchall():
+                    item = dict(row)
+                    try:
+                        item["related_cves"] = json.loads(item["related_cves"])
+                    except Exception:
+                        pass
+                    try:
+                        item["finding_titles"] = json.loads(item["finding_titles"])
+                    except Exception:
+                        pass
+                    results.append(item)
+                return results
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to retrieve correlation clusters: {error}") from error
 
     def get_iocs_by_type(self, ioc_type: str) -> list[dict]:
         """Retrieve all IOCs of a specific type."""
@@ -308,6 +416,7 @@ class StateManager:
         try:
             with self._connection() as connection:
                 cursor = connection.execute(query, (ioc_type,))
+                return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to retrieve IOCs of type {ioc_type}: {error}") from error
 
@@ -321,3 +430,35 @@ class StateManager:
                 return dict(row) if row else None
         except sqlite3.Error as error:
             raise RuntimeError(f"Failed to retrieve threat analysis for {cve_id}: {error}") from error
+
+    def store_historical_context(self, reference_key: str, context_data: str | dict, source: str = "cti-agent") -> None:
+        """Store arbitrary historical context keyed by reference_key."""
+        statement = """
+        INSERT OR REPLACE INTO historical_context (reference_key, context_data, source, stored_at)
+        VALUES (?, ?, ?, ?);
+        """
+        data_str = json.dumps(context_data) if isinstance(context_data, (dict, list)) else str(context_data)
+        stored_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connection() as connection:
+                connection.execute(statement, (reference_key, data_str, source, stored_at))
+                connection.commit()
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to store historical context for {reference_key}: {error}") from error
+
+    def get_historical_context(self, reference_key: str) -> dict | str | None:
+        """Retrieve historical context by reference_key."""
+        query = "SELECT context_data FROM historical_context WHERE reference_key = ? LIMIT 1;"
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(query, (reference_key,))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                val = row["context_data"]
+                try:
+                    return json.loads(val)
+                except Exception:
+                    return val
+        except sqlite3.Error as error:
+            raise RuntimeError(f"Failed to get historical context for {reference_key}: {error}") from error

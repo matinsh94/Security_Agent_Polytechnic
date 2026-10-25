@@ -19,6 +19,18 @@ from scripts.ioc_extractor import IOCExtractor
 from scripts.report_generator import ReportGenerator, ThreatFinding
 from scripts.state_manager import StateManager
 from scripts.threat_scorer import ThreatScorer
+from scripts.siem_connector import SIEMConnector
+from scripts.chat_bot import ChatBot
+from scripts.vector_store import VectorStore
+from scripts.anomaly_detector import AnomalyDetector
+from scripts.threat_actor_attribution import ThreatActorAttribution
+from scripts.geo_mapper import GeoMapper
+from scripts.playbook_engine import PlaybookEngine
+from scripts.threat_classifier import ThreatClassifier
+from scripts.fp_filter import FPFilter
+from scripts.breach_predictor import BreachPredictor
+from scripts.malware_clusterer import MalwareClusterer
+from scripts.zero_day_predictor import ZeroDayPredictor
 
 
 # Configure logging
@@ -122,7 +134,7 @@ def _create_threat_findings(
         mapping_text = " ".join(filter(None, [getattr(item, 'vulnerability_type', ''), item.title, item.summary_en]))
         if mapping_text:
             mappings = enricher.get_mitre_mappings(mapping_text)
-            mitre_tactics = [m.tactic for m in mappings]
+            mitre_tactics = list(dict.fromkeys(m.tactic for m in mappings))
 
         # Create threat finding
         finding = ThreatFinding(
@@ -252,6 +264,99 @@ def main() -> int:
 
         # Create threat findings with enrichment
         findings = _create_threat_findings(analysis_result.items, scorer, enricher, extractor)
+
+        # Persist extracted intelligence into database
+        for finding in findings:
+            article_id = None
+            for entry in entries:
+                if entry.title == finding.title:
+                    article_id = state_manager.get_article_id_by_url(entry.url)
+                    break
+
+            if finding.cve_id:
+                try:
+                    state_manager.store_vulnerability(
+                        cve_id=finding.cve_id,
+                        cvss_score=finding.cvss_score,
+                        severity=finding.severity,
+                        description=finding.description,
+                    )
+                except Exception:
+                    logger.debug("Failed to store vulnerability %s", finding.cve_id)
+
+            for ioc in finding.iocs or []:
+                try:
+                    state_manager.store_ioc(
+                        ioc_type=ioc.get("ioc_type", "unknown"),
+                        value=ioc.get("value", ""),
+                        source_article_id=article_id,
+                        confidence=ioc.get("confidence", 0.8),
+                    )
+                except Exception:
+                    logger.debug("Failed to store IOC")
+
+            if article_id:
+                try:
+                    state_manager.store_threat_analysis(
+                        article_id=article_id,
+                        cve_id=finding.cve_id,
+                        threat_score=finding.threat_score,
+                        severity=finding.severity,
+                        attack_vector="",
+                        affected_assets=finding.affected_systems or [],
+                        remediation_en=finding.remediation_en,
+                        remediation_fa=finding.remediation_secondary,
+                    )
+                except Exception:
+                    logger.debug("Failed to store threat analysis")
+
+            for tactic in finding.mitre_tactics or []:
+                if finding.cve_id:
+                    try:
+                        state_manager.store_mitre_mapping(
+                            cve_id=finding.cve_id,
+                            tactic=tactic,
+                            technique_id="",
+                            technique_name="",
+                        )
+                    except Exception:
+                        logger.debug("Failed to store MITRE mapping")
+
+        # Phase 3-5 enhancements (integrated workflow)
+        try:
+            vs = VectorStore(db_path=str(Path(__file__).resolve().parent / "data" / "vector.db"))
+            for f in findings:
+                vs.add(f.title, f.description or "", {"score": f.threat_score})
+            anomaly = AnomalyDetector()
+            scores = [float(f.threat_score) for f in findings]
+            anomalies = anomaly.detect(scores)
+            attribution = ThreatActorAttribution()
+            geo = GeoMapper()
+            playbook_engine = PlaybookEngine(playbook_dir=str(Path(__file__).resolve().parent / "playbooks"))
+            classifier = ThreatClassifier(model_path=str(Path(__file__).resolve().parent / "data" / "threat_classifier.pkl"))
+            fp_filter = FPFilter()
+            breach = BreachPredictor()
+            clusterer = MalwareClusterer()
+            zeroday = ZeroDayPredictor()
+            playbooks = []
+            for f in findings:
+                actors = attribution.attribute(f.description or "", [f.cve_id] if f.cve_id else [])
+                geo.map_many([ioc.get("value", "") for ioc in (f.iocs or []) if ioc.get("ioc_type") == "ipv4"])
+                playbooks.append(playbook_engine.generate({"cve_id": f.cve_id, "ioc": (f.iocs or [{}])[0].get("value")}))
+                is_fp = any(fp_filter.is_false_positive(ioc.get("value", "")) for ioc in (f.iocs or []))
+                breach_score = breach.score({"threat_score": f.threat_score, "cves": [f.cve_id] if f.cve_id else []})
+                zd = zeroday.predict(f.description or "")
+                _ = classifier.predict(f.description or "")
+                _ = clusterer.cluster([{"family": a} for a in actors] or [{"family": "unknown"}])
+                _ = is_fp, breach_score, zd
+            logger.info("Phase 3-5 enhancements applied: vector=%d anomalies=%d playbooks=%d", len(findings), sum(anomalies), len(playbooks))
+            # Optional SIEM/chatbot if configured
+            siem = SIEMConnector()
+            siem.send([{"title": f.title, "score": f.threat_score} for f in findings])
+            ChatBot().send(f"CTI run complete: {len(findings)} findings")
+        except Exception as e:
+            logger.debug("Phase 3-5 enhancement error: %s", e)
+
         correlation_result = correlation_engine.correlate(findings)
         correlation_data = correlation_result.to_dict()
 

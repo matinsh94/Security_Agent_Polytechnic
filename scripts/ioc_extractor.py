@@ -144,6 +144,12 @@ class IOCExtractor:
             and not ip_obj.is_reserved
         )
 
+    FILE_EXTENSIONS = {
+        "py", "exe", "dll", "sh", "bat", "cmd", "ps1", "vbs", "js", "json",
+        "yml", "yaml", "xml", "txt", "log", "csv", "md", "tar", "gz", "zip",
+        "7z", "iso", "bin", "elf", "so", "dylib", "cfg", "conf", "ini", "apk", "jar"
+    }
+
     @staticmethod
     def _is_valid_domain(domain: str) -> bool:
         labels = domain.split('.')
@@ -154,6 +160,8 @@ class IOCExtractor:
         if all(label.isdigit() for label in labels):
             return False
         if len(labels[-1]) < 2:
+            return False
+        if len(labels) == 2 and labels[-1].lower() in IOCExtractor.FILE_EXTENSIONS and labels[0].lower() != "www":
             return False
         return True
 

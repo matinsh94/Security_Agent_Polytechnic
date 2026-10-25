@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cti-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cti-agent
+  template:
+    metadata:
+      labels:
+        app: cti-agent
+    spec:
+      containers:
+      - name: cti-agent
+        image: cti-agent:latest
+        envFrom:
+        - secretRef:
+            name: cti-secrets
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cti-agent
+spec:
+  selector:
+    app: cti-agent
+  ports:
+  - port: 8000
+    targetPort: 8000

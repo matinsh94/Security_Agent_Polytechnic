@@ -89,7 +89,7 @@ class Enricher:
         if not isinstance(metrics, dict):
             return 0.0, ""
 
-        for metric_key in ("cvssMetricV31", "cvssMetricV30"):
+        for metric_key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
             metric_list = metrics.get(metric_key)
             if isinstance(metric_list, list) and metric_list:
                 metric = metric_list[0]
@@ -194,8 +194,23 @@ class Enricher:
             ("authentication bypass", [
                 MITREMapping(tactic="Initial Access", technique_id="T1190", technique_name="Exploit Public-Facing Application"),
             ]),
+            ("command injection", [
+                MITREMapping(tactic="Execution", technique_id="T1059", technique_name="Command and Scripting Interpreter"),
+            ]),
+            ("sql injection", [
+                MITREMapping(tactic="Initial Access", technique_id="T1190", technique_name="Exploit Public-Facing Application"),
+            ]),
+            ("sqli", [
+                MITREMapping(tactic="Initial Access", technique_id="T1190", technique_name="Exploit Public-Facing Application"),
+            ]),
             ("injection", [
                 MITREMapping(tactic="Execution", technique_id="T1059", technique_name="Command and Scripting Interpreter"),
+            ]),
+            ("cross-site scripting", [
+                MITREMapping(tactic="Execution", technique_id="T1059.007", technique_name="JavaScript"),
+            ]),
+            ("xss", [
+                MITREMapping(tactic="Execution", technique_id="T1059.007", technique_name="JavaScript"),
             ]),
             ("denial of service", [
                 MITREMapping(tactic="Impact", technique_id="T1499", technique_name="Endpoint Denial of Service"),
@@ -210,11 +225,30 @@ class Enricher:
             ("supply chain", [
                 MITREMapping(tactic="Initial Access", technique_id="T1195", technique_name="Supply Chain Compromise"),
             ]),
+            ("phishing", [
+                MITREMapping(tactic="Initial Access", technique_id="T1566", technique_name="Phishing"),
+            ]),
+            ("credential", [
+                MITREMapping(tactic="Credential Access", technique_id="T1003", technique_name="OS Credential Dumping"),
+            ]),
+            ("exfiltrat", [
+                MITREMapping(tactic="Exfiltration", technique_id="T1041", technique_name="Exfiltration Over C2 Channel"),
+            ]),
+            ("lateral movement", [
+                MITREMapping(tactic="Lateral Movement", technique_id="T1021", technique_name="Remote Services"),
+            ]),
+            ("backdoor", [
+                MITREMapping(tactic="Persistence", technique_id="T1543", technique_name="Create or Modify System Process"),
+            ]),
         ]
 
+        seen_techniques: set[str] = set()
         for keyword, keyword_mapped in keyword_mappings:
             if keyword in text:
-                mappings.extend(keyword_mapped)
+                for mapping in keyword_mapped:
+                    if mapping.technique_id not in seen_techniques:
+                        seen_techniques.add(mapping.technique_id)
+                        mappings.append(mapping)
 
         return mappings
 

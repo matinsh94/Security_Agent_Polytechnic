@@ -12,3 +12,10 @@ pytest>=7.0.0,<9.0.0
 # jinja2>=3.1.0  # Report templating
 # python-telegram-bot>=20.0  # Telegram integration
 # PyGithub>=2.0.0  # GitHub API integration
+
+# Phase 3-5 optional dependencies
+# fastapi>=0.110.0
+# uvicorn>=0.27.0
+# scikit-learn>=1.4.0
+# pyyaml>=6.0
+# chromadb>=0.4.0
