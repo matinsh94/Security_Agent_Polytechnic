@@ -18,16 +18,23 @@ class SIEMConnector:
         self.timeout = int(os.getenv("FEED_TIMEOUT", "15"))
 
     def send(self, events: list[dict[str, Any]]) -> dict[str, bool]:
+        normalized = [{"event": e, "source": "cti-platform"} for e in events]
         results = {}
         if self.splunk_hec_url and self.splunk_hec_token:
-            results["splunk"] = self._send_splunk(events)
+            results["splunk"] = self._send_with_retry(self._send_splunk, normalized)
         if self.elk_url:
-            results["elk"] = self._send_elk(events)
+            results["elk"] = self._send_with_retry(self._send_elk, normalized)
         if self.sumo_url:
-            results["sumo"] = self._send_sumo(events)
+            results["sumo"] = self._send_with_retry(self._send_sumo, normalized)
         if not results:
             logger.info("SIEM not configured; skipping")
         return results
+
+    def _send_with_retry(self, fn, events, attempts=3):
+        for i in range(attempts):
+            if fn(events):
+                return True
+        return False
 
     def _post(self, url, headers, payload):
         if requests is None:

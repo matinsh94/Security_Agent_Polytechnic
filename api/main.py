@@ -11,7 +11,13 @@ def create_app():
         from fastapi import FastAPI, HTTPException
     except ImportError:
         raise RuntimeError("fastapi not installed")
-    app = FastAPI(title="CTI API")
+    from fastapi import Header
+    token_env = os.getenv("API_TOKEN")
+
+    def _auth(x_api_token: str | None = Header(default=None)):
+        if token_env and x_api_token != token_env:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        return True
     db_path = Path(os.getenv("DATABASE_PATH", "data/agent_state.db"))
     sm = StateManager(db_path=db_path)
 
